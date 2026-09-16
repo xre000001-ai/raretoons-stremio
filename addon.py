@@ -160,7 +160,9 @@ HINTS_FILE = ROOT / "stream_hints.json"
 # --------------------------------------------------------------------------
 # TMDB config - like Stremio addons do
 # --------------------------------------------------------------------------
-DEFAULT_TMDB_KEY = "1af06616dcbb28ff03088d87d63211f5"
+# public repo: no embedded key — set TMDB_API_KEY (or TMDB_KEY) env,
+# or pass per-user via /{key}/manifest.json or ?tmdbApiKey=
+DEFAULT_TMDB_KEY = ""
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY") or os.environ.get("TMDB_KEY") or DEFAULT_TMDB_KEY
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
