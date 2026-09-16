@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.log
+parse_*.log
+*.html
+crawl_state.json
+parse_done.json
+hub_pages.jsonl
+episode_streams.jsonl
+sitemap.xml
+tmdb_cache.json
+stream_hints.json
