@@ -51,7 +51,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -177,7 +177,7 @@ _MASTER_RE = re.compile(r'"file":"(https:[^"]+\.m3u8)"')
 _WALL_RE = re.compile(r'data-href="([^"]+)"')
 
 
-def _zipper_walk(zipper, max_hops=4):
+def _zipper_walk(zipper, max_hops=4, deadline=None):
     """codedew zipper links (all non-Hindi languages, and movies) sit
     behind a 3-step "Security Scan" wall: each wall page carries a
     goBtn data-href and the NEXT hop only resolves when the cookies
@@ -189,6 +189,8 @@ def _zipper_walk(zipper, max_hops=4):
     url = zipper
     t = ""
     for _ in range(max_hops + 1):
+        if deadline and time.monotonic() > deadline:
+            return t, None          # resolve budget exhausted - no card
         r = sess.get(url, headers={"User-Agent": UA, "Accept": "*/*",
                                    "Accept-Language": "en-US,en;q=0.9",
                                    "Referer": prev},
@@ -218,9 +220,10 @@ def _mq_resolve(zipper):
             return hit[1], hit[2]
     embed = None
     master = None
+    deadline = time.monotonic() + 10.0
     try:
-        zp, embed = _zipper_walk(zipper)
-        if embed:
+        zp, embed = _zipper_walk(zipper, deadline=deadline)
+        if embed and time.monotonic() < deadline:
             ep = cf_get(embed, referer=zipper).text or ""
             b = _BLOB_RE.search(ep)
             if b:
@@ -505,36 +508,26 @@ def handle_stream(mtype, mid):
         note = ""
         if dub_show and lang.lower() == "hindi sub":
             note = " — site has no dub for this episode yet"
-        if master:
-            url = f"{base}/mq/{_mq_token(z)}.m3u8"
-            streams.append({
-                "name": f"RT2 • {lang} • MQ",
-                "title": (f"{prefix} • {ep_title} — MultiQuality (HLS, "
-                          f"in-app){note}"),
-                "description": (f"{prefix}\n◈ {lang}\n◈ MQ 1080p/720p/360p "
-                                "\n◈ plays inside the app"),
-                "url": url,
-                "behaviorHints": {
-                    "notWebReady": False,
-                    "bingeGroup": f"rt2|mq|{lang.lower()}",
-                    "filename": f"{prefix}.m3u8",
-                },
-            })
-        else:
-            # no HLS in budget: the show hub is the site's own working UI
-            # (some language links sit behind its 3-step link-scan wall,
-            # so a bare zipper would land on the ad interstitial)
-            target = embed or rec.get("hub") or z
-            streams.append({
-                "name": f"RT2 • {lang} • MQ",
-                "title": (f"{prefix} • {ep_title} — MQ (opens website)"
-                          f"{note}"),
-                "description": (f"{prefix}\n◈ {lang}\n◈ opens the show page "
-                                "on the site (pick the episode there)"),
-                "url": target,
-                "externalUrl": target,
-                "behaviorHints": {"notWebReady": True},
-            })
+        # PLAYABLE-ONLY policy (user request): a language that cannot be
+        # resolved to our in-app HLS gets NO card at all — dead/website
+        # cards are worse than none.  (Series multi-language files are
+        # download-only on the site, so those simply never appear.)
+        if not master:
+            continue
+        url = f"{base}/mq/{_mq_token(z)}.m3u8"
+        streams.append({
+            "name": f"RT2 • {lang} • MQ",
+            "title": (f"{prefix} • {ep_title} — MultiQuality (HLS, "
+                      f"in-app){note}"),
+            "description": (f"{prefix}\n◈ {lang}\n◈ MQ 1080p/720p/360p "
+                            "\n◈ plays inside the app"),
+            "url": url,
+            "behaviorHints": {
+                "notWebReady": False,
+                "bingeGroup": f"rt2|mq|{lang.lower()}",
+                "filename": f"{prefix}.m3u8",
+            },
+        })
     return {"streams": streams}
 
 
