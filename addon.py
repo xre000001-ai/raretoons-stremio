@@ -1,43 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RareToons 2.0 — Stremio addon, rebuilt from scratch on 2026-09-30.
+RareToons 2.2 — Stremio addon (MQ-HLS in-app playback).
 
-The previous addon accumulated months of workarounds (zipper 302 chains,
-POST APIs, lazy placeholder cards, election logic, TMDB enrichment).
-The site changed under it repeatedly and playback broke.  This file is a
-clean-room rewrite against the site AS IT WORKS TODAY (every step below
-was verified live on 2026-09-30 before being coded).
+v2.2.0 (2026-09-30): the ONLY cards we emit are the site's MultiQuality
+(MQ) player, served IN-APP as HLS.  Verified end-to-end against the site:
 
-HOW THE SITE WORKS TODAY (verified 2026-09-30)
-----------------------------------------------
-* Show pages (www.rareanimes.mov/...) list per-episode links shaped
-  https://codedew.com/zipper/?url=<percent-encoded-file-id>  ("zipper").
-* A zipper page today embeds a player iframe (argon.razorshell.space)
-  and auto-advances episodes.  That is the SITE's own player and plays
-  in any browser — this is the playback path every user confirmed works.
-* Independently, https://codedew.com/streambeta/?url=<same-file-id>
-  returns a server-rendered page whose HTML embeds
-      let playerSources = [ {"url": "<signed worker URL>", "name": "V1"}, ... ]
-  with V1..V4 entries: workers.dev signed direct-file URLs, a pixeldrain
-  mirror, and a download portal (fused out below).  This is what we use
-  for IN-APP playback.
+  1. an episode's `mq` zipper (codedew.com/zipper/?url=<fid>) page embeds
+     the player iframe  https://argon.razorshell.space/embed/<id>
+  2. the embed page carries  _juicycodes("<base64 blob>")  — a simple
+     symbol-map cipher (ported to Python below) that decodes to the
+     JWPlayer `var config = {...}` JSON, whose sources.file is the
+     1080p/720p/360p HLS master (groovy.monster, #POWERED-BY JUICYCODES)
+  3. master + variant playlists + MPEG-TS segments all answer 200 to the
+     curl_cffi/impersonate client (plain clients get a CF 403).
 
-DESIGN (small on purpose)
--------------------------
-1. Resolution happens AT REQUEST TIME with a hard budget; no placeholder
-   or "lazy" cards — every card is either a real proxied stream or the
-   site's browser player.  A failed resolve still leaves the browser
-   card, so the list is never empty.
-2. In-app playback goes THROUGH this addon (/s/ route: same-origin,
-   CORS-open, correct Content-Type).  Direct worker URLs 302s failed for
-   many ISPs/players; the addon-domain path is the one that plays.
-3. /s/ carries a Range normalizer: some origins ignore Range and return
-   the full body with 200 — we slice server-side and emit a proper 206.
-4. No TMDB, no catalogs zoo, no elections, no background jobs.  Site
-   data only: episodes_index.jsonl (rows) + posters.json (og:images).
-5. beamup-ready: buildpack (Procfile), PORT env, public base rebuilt
-   from the bare Host header the beamup router sends.
+The addon rewrites the whole HLS tree to same-origin /mq/... URLs, so
+Stremio (desktop / Android / web) plays it like any other HLS stream.
+
+Cards: ONE per language ("RT2 • Hindi • MQ", ...).  Fallback when the
+chain cannot be resolved in time: the argon embed page itself, which
+autoplays in any browser.  Streams also resolve for foreign ids
+(tt... from other catalogs' metas) via the free Cinemeta API.
 
 Run:  python3 addon.py [port]     (binds 0.0.0.0)
 """
@@ -49,7 +33,7 @@ import sys
 import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote, quote
+from urllib.parse import urlparse, parse_qs, unquote, quote, urljoin
 
 import requests
 from curl_cffi import requests as creq
@@ -61,28 +45,23 @@ def _env_int(k, d):
 
 PORT = _env_int("PORT", 7700)
 HOST_SUFFIX = os.environ.get("HOST_SUFFIX", ".baby-beamup.club")
-RESOLVE_TIMEOUT = _env_int("RESOLVE_TIMEOUT", 9)     # per-zipper seconds
-LIST_BUDGET = _env_int("LIST_BUDGET", 7)             # whole /stream request
-PICK_TTL = _env_int("PICK_TTL", 600)                 # /s/ pinned source TTL
-SRC_TTL = _env_int("SRC_TTL", 600)                   # zipper→sources cache
+RESOLVE_TIMEOUT = _env_int("RESOLVE_TIMEOUT", 8)
+LIST_BUDGET = _env_int("LIST_BUDGET", 10)          # whole /stream request
+HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
+NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-MAX_SERVERS = 3                                       # V1..V3 in-app cards
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 ADDON_ID = "community.raretoons2"
-
 BASE = os.path.dirname(os.path.abspath(__file__))
+SEG_SITE = "https://www.rareanimes.mov/"
 
 CONTENT_TYPES = {
-    ".mkv": "video/x-matroska", ".mp4": "video/mp4", ".webm": "video/webm",
-    ".mov": "video/quicktime", ".avi": "video/x-msvideo", ".m4v": "video/x-m4v",
-    ".ts": "video/mp2t", ".bin": "application/octet-stream",
+    ".m3u8": "application/vnd.apple.mpegurl",
+    ".ts": "video/mp2t", ".mp4": "video/mp4", ".vtt": "text/vtt",
+    ".key": "application/octet-stream", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".bin": "application/octet-stream",
 }
-
-# Hosts that are download portals / players, not direct files:
-_DROP_HOST = re.compile(
-    r"(fuckingfast\.net|mega\.nz|mediafire|drive\.google|1fichier|"
-    r"colonel-fans|argon\.razorshell)", re.I)
 
 # ------------------------------------------------------------------ data --
 def _slug(text):
@@ -102,25 +81,14 @@ try:
 except Exception:
     pass
 
-# slug -> show record
 SHOWS = {}
 
 
 def _display(show):
-    """Trim the site's SEO tail off a show name for display."""
     s = re.split(r"\s+(?:[-–]\s+)?(?:Hindi|Tamil|Telugu|WatchMulti|Multi)\b",
                  show or "", maxsplit=1)[0].strip(" -–")
     s = re.sub(r"\s*(?:[-–]\s*)?Episodes?\.?\s*$", "", s, flags=re.I).strip(" -–")
     return s or show
-
-
-def _is_movie(show):
-    return bool(re.search(r"\bmovie\b|\(\d{4}\)", show, re.I)) or \
-        all((r.get("season") or 0) == 0 for r in _rows_of_show(show))
-
-
-def _rows_of_show(show):
-    return [r for r in ROWS if r.get("show") == show]
 
 
 def _build_shows():
@@ -129,19 +97,13 @@ def _build_shows():
         slug = _slug(show)
         rec = SHOWS.get(slug)
         if rec is None:
-            rec = {
-                "slug": slug, "name": _display(show), "site_name": show,
-                "hub": r.get("hub_url") or "", "poster": POSTERS.get(show, ""),
-                "movie": None, "eps": {},
-            }
+            rec = {"slug": slug, "name": _display(show), "site_name": show,
+                   "hub": r.get("hub_url") or "",
+                   "poster": POSTERS.get(show, ""), "movie": None, "eps": {}}
             SHOWS[slug] = rec
         s = int(r.get("season") or 0)
         e = int(r.get("episode") or 0)
-        key = (s, e)
-        bucket = rec["eps"].get(key)
-        if bucket is None:
-            rec["eps"][key] = bucket = []
-        bucket.append(r)
+        rec["eps"].setdefault((s, e), []).append(r)
     for rec in SHOWS.values():
         rec["movie"] = all((k[0] or 0) == 0 for k in rec["eps"]) if rec["eps"] else False
         rec["poster"] = rec["poster"] or POSTERS.get(rec["site_name"], "")
@@ -152,103 +114,97 @@ SERIES = [r for r in SHOWS.values() if not r["movie"]]
 MOVIES = [r for r in SHOWS.values() if r["movie"]]
 
 # ------------------------------------------------------------------ http --
-_cf_lock = threading.Lock()
-
-
 def cf_get(url, referer=None, timeout=RESOLVE_TIMEOUT):
-    """codedew/argon pages sit behind Cloudflare - use the impersonating
-    client (verified working against the site)."""
+    """codedew/argon/groovy sit behind Cloudflare - the impersonating
+    client is required (plain requests get a 403 challenge)."""
     headers = {"User-Agent": UA, "Accept": "*/*",
                "Accept-Language": "en-US,en;q=0.9"}
     if referer:
         headers["Referer"] = referer
-    with _cf_lock:
-        return creq.get(url, headers=headers, timeout=timeout,
-                        allow_redirects=True, impersonate="chrome")
+    return creq.get(url, headers=headers, timeout=timeout,
+                    allow_redirects=True, impersonate="chrome")
 
 
-def plain_get(url, rng=None, timeout=20):
+def cf_stream(url, referer=None, rng=None, timeout=30):
+    """Streaming variant (no lock) for /mq child proxying."""
     headers = {"User-Agent": UA, "Accept": "*/*"}
+    if referer:
+        headers["Referer"] = referer
     if rng:
         headers["Range"] = rng
-    return requests.get(url, headers=headers, timeout=timeout, stream=True,
-                        allow_redirects=True)
+    return creq.get(url, headers=headers, timeout=timeout, stream=True,
+                    allow_redirects=True, impersonate="chrome")
 
 
-# ------------------------------------------------------------- resolution --
-# zipper -> (expiry, [ {url, name, filename} ... ])
-_src_cache = {}
-_src_lock = threading.Lock()
-_INFLIGHT = {}
+# ------------------------------------------------------- MQ-HLS resolver --
+_JUICY_SYMBOLS = ["`", "%", "-", "+", "*", "$", "!", "_", "^", "="]
 
 
-def _parse_player_sources(html):
-    """playerSources JSON out of a streambeta page; falls back to a plain
-    scan for signed worker URLs."""
-    out = []
-    m = re.search(r"(?:let|var|const)\s+playerSources\s*=\s*(\[.*?\])\s*;",
-                  html or "", re.S)
-    if m:
-        try:
-            for it in json.loads(m.group(1)):
-                u = it.get("url") or it.get("stream_url") or ""
-                if not u:
-                    continue
-                out.append({"url": u, "name": (it.get("name") or "").upper(),
-                            "filename": it.get("filename") or ""})
-        except Exception:
-            pass
-    if not out:
-        T = r"[A-Za-z0-9_\-.~+/=&?%]+"
-        for mm in re.finditer(r"https?://[a-z0-9.-]*workers\.dev/" + T, html or ""):
-            out.append({"url": mm.group(0).rstrip(" ,;\"')"), "name": "", "filename": ""})
-    # drop portals / junk, keep order
-    keep = []
-    for s in out:
-        u = s["url"]
-        if _DROP_HOST.search(u):
-            continue
-        if u.endswith(".m3u8") or ".m3u8?" in u:
-            continue
-        keep.append(s)
-    seen, dedup = set(), []
-    for s in keep:
-        if s["url"] not in seen:
-            seen.add(s["url"])
-            dedup.append(s)
-    return dedup
+def _juicy_decode(blob):
+    """Port of the site's _juicycodes(): base64 -> symbol-map digits ->
+    4-digit groups -> chr(group % 1000 - salt).  Salt comes from the last
+    3 chars (each ord()-100).  Returns the JWPlayer config JS/JSON."""
+    salt = int("".join(str(ord(c) - 100) for c in blob[-3:]))
+    body = blob[:-3]
+    # site JS: input.replace(/_/g,"+").replace(/-/g,"/") then a base64 loop
+    # whose alphabet is the STANDARD one and which simply skips characters
+    # outside it - replicate exactly (plain urlsafe_b64decode would instead
+    # count +/- inconsistently and break on mixed blobs).
+    t = re.sub(r"[^A-Za-z0-9+/=]",
+               "", body.replace("-", "+").replace("_", "/"))
+    s = base64.b64decode(t + "=" * (-len(t) % 4)).decode("latin-1")
+    digits = "".join(
+        str(_JUICY_SYMBOLS.index(c)) if c in _JUICY_SYMBOLS else "0"
+        for c in s)
+    return "".join(chr(int(digits[i:i + 4]) % 1000 - salt)
+                   for i in range(0, len(digits) // 4 * 4, 4))
 
 
-def resolve_zipper(zipper, timeout=RESOLVE_TIMEOUT):
-    """codedew zipper -> [{"url","name","filename"}] (cached, TTL SRC_TTL)."""
-    if not zipper:
-        return []
+_hls_cache = {}
+_hls_lock = threading.Lock()
+_EMB_RE = re.compile(r'<iframe[^>]+src="([^"]*argon\.razorshell\.space[^"]*)"')
+_BLOB_RE = re.compile(r'_juicycodes\(\s*((?:"[A-Za-z0-9+/=_-]{1,}"\s*\+\s*)+'
+                      r'"[A-Za-z0-9+/=_-]{1,}")\s*\)')
+_MASTER_RE = re.compile(r'"file":"(https:[^"]+\.m3u8)"')
+
+
+def _mq_resolve(zipper):
+    """zipper -> (master_m3u8_url, embed_url) or (None, embed_url).
+    zipper page -> argon iframe -> embed page -> juicy blob -> config."""
     now = time.time()
-    with _src_lock:
-        hit = _src_cache.get(zipper)
+    with _hls_lock:
+        hit = _hls_cache.get(zipper)
         if hit and hit[0] > now:
-            return hit[1]
-    m = re.search(r"[?&]url=([^&\"']+)", zipper)
-    if not m:
-        return []
-    page_url = "https://codedew.com/streambeta/?url=" + m.group(1)
+            return hit[1], hit[2]
+    embed = None
+    master = None
     try:
-        r = cf_get(page_url, referer=zipper, timeout=timeout)
-        sources = _parse_player_sources(r.text) if r.status_code == 200 else []
+        zp = cf_get(zipper, referer=SEG_SITE).text or ""
+        m = _EMB_RE.search(zp)
+        if m:
+            embed = m.group(1)
+            ep = cf_get(embed, referer=zipper).text or ""
+            b = _BLOB_RE.search(ep)
+            if b:
+                blob = "".join(re.findall(r'"([A-Za-z0-9+/=_-]*)"', b.group(1)))
+                dec = _juicy_decode(blob)
+                mm = _MASTER_RE.search(dec)
+                if mm:
+                    master = mm.group(1).replace("\\/", "/")
     except Exception:
-        sources = []
-    with _src_lock:
-        _src_cache[zipper] = (now + SRC_TTL, sources)
-    return sources
+        pass
+    ttl = HLS_TTL if master else NEG_TTL
+    with _hls_lock:
+        _hls_cache[zipper] = (now + ttl, master, embed)
+    return master, embed
 
 
-def resolve_many(zippers):
-    """Resolve several zippers in parallel, respecting the request budget."""
-    out = {z: [] for z in zippers}
+def _mq_resolve_many(zippers):
+    out = {z: (None, None) for z in zippers}
     threads = []
 
     def _run(z):
-        out[z] = resolve_zipper(z)
+        out[z] = _mq_resolve(z)
 
     for z in zippers:
         t = threading.Thread(target=_run, args=(z,), daemon=True)
@@ -256,28 +212,8 @@ def resolve_many(zippers):
         threads.append(t)
     deadline = time.time() + LIST_BUDGET
     for t in threads:
-        t.join(max(0.2, deadline - time.time()))
+        t.join(max(0.1, deadline - time.time()))
     return out
-
-
-# ----------------------------------------------------------------- urls ----
-def _token(zipper, index=0):
-    return base64.urlsafe_b64encode(
-        f"{zipper}\x00{index}".encode()).decode().rstrip("=")
-
-
-def _decode_token(tok):
-    try:
-        pad = "=" * (-len(tok) % 4)
-        raw = base64.urlsafe_b64decode((tok + pad).encode()).decode()
-        z, _, i = raw.partition("\x00")
-        return z, (int(i) if i.isdigit() else 0)
-    except Exception:
-        return "", 0
-
-
-def _proxy_url(base, zipper, index=0, ext=".mkv"):
-    return f"{base}/s/{_token(zipper, index)}{ext}"
 
 
 def public_base_from(handler):
@@ -288,88 +224,26 @@ def public_base_from(handler):
     return f"{proto}://{host}"
 
 
+def _mq_token(zipper):
+    return base64.urlsafe_b64encode(zipper.encode()).decode().rstrip("=")
+
+
+def _mq_decode_token(tok):
+    try:
+        pad = "=" * (-len(tok) % 4)
+        return base64.urlsafe_b64decode((tok + pad).encode()).decode()
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------- cards ----
-def _ext_of(url):
-    m = re.search(r"\.(mkv|mp4|webm|mov|avi|m4v)(?:[?#]|$)", url, re.I)
-    return ("." + m.group(1).lower()) if m else ".mkv"
-
-
 def _lang_label(raw):
     lang = re.sub(r"\s*(uncut|censored)\s*$", "", raw or "", flags=re.I).strip()
-    if not lang:
-        lang = "Hindi"
-    return "Multi" if lang.lower().startswith("watch") else lang
+    return lang or "Hindi"
 
-
-def _cards_for_zipper(base, prefix, ep_title, lang, zipper, sources):
-    """Build the card list for one language zipper:
-    in-app proxy cards (real resolved servers) + the site browser player."""
-    cards, seen = [], set()
-    lang_l = _lang_label(lang)
-    listed = sources[:MAX_SERVERS]
-    for i, s in enumerate(listed):
-        ext = _ext_of(s["url"])
-        url = _proxy_url(base, zipper, i, ext)
-        if url in seen:
-            continue
-        seen.add(url)
-        srv = s.get("name") or f"V{i + 1}"
-        fname = s.get("filename") or f"{prefix}{ext}"
-        cards.append({
-            "name": f"RT2 • {lang_l}",
-            "title": f"{prefix} • {ep_title} — {srv} (in-app)",
-            "description": f"{prefix}\n◈ {lang_l}\n◈ Server {srv}\n◈ plays inside the app",
-            "url": url,
-            "behaviorHints": {
-                "notWebReady": False,
-                "bingeGroup": f"rt2|inapp|{lang_l.lower()}",
-                "filename": fname,
-            },
-        })
-    if zipper not in seen:
-        cards.append({
-            "name": f"RT2 • {lang_l}",
-            "title": f"{prefix} • {ep_title} — Site Player (browser)",
-            "description": f"{prefix}\n◈ {lang_l}\n◈ opens the site's own player in a browser",
-            "url": zipper,
-            "externalUrl": zipper,
-            "behaviorHints": {"notWebReady": True},
-        })
-    return cards
-
-
-def _browser_only_card(prefix, ep_title, lang, zipper):
-    return [{
-        "name": f"RT2 • {_lang_label(lang)}",
-        "title": f"{prefix} • {ep_title} — Site Player (browser)",
-        "description": f"{prefix}\n◈ {_lang_label(lang)}\n◈ opens the site's own player in a browser",
-        "url": zipper,
-        "externalUrl": zipper,
-        "behaviorHints": {"notWebReady": True},
-    }]
-
-
-# -------------------------------------------------------------- handlers ---
-def _mq_card(prefix, ep_title, lang, zipper):
-    """The one card per language: the site's own MultiQuality player.
-    This is the path that plays everywhere (in Stremio's player), so the
-    V1/V2/V3 in-app mirror cards were dropped in v2.1.0 on user request."""
-    lang_l = _lang_label(lang)
-    return {
-        "name": f"RT2 • {lang_l} • MQ",
-        "title": f"{prefix} • {ep_title} — MultiQuality (site player)",
-        "description": f"{prefix}\n◈ {lang_l}\n◈ MQ player — plays in app",
-        "url": zipper,
-        "externalUrl": zipper,
-        "behaviorHints": {"notWebReady": True},
-    }
 
 
 # -------------------------------------------------- other-catalog streams --
-# Stremio asks us for streams with foreign ids too (tt... from Cinemeta's
-# catalogs).  Resolve the title via the free public Cinemeta API and fuzzy-
-# match it against the site index, so streams appear on OTHER catalogs too
-# (v2.1.0, user request).  No API key needed.
 _CINEMETA = "https://v3-cinemeta.strem.io/meta/{t}/{id}.json"
 _cine_cache = {}
 _cine_lock = threading.Lock()
@@ -415,8 +289,6 @@ def _match_show(title, season):
         bn = _norm_title(_base_title(rec))
         if not bn:
             continue
-        if len(min(bn, tn, key=len)) < 4 and bn != tn:
-            continue
         if bn in tn or tn in bn:
             has = season is None or any(k[0] == season for k in rec["eps"])
             score = (2 if has else 0) + (3 if bn == tn else 0)
@@ -443,14 +315,16 @@ def _rows_for(rec, s_filter, e_filter):
     return rows
 
 
+# -------------------------------------------------------------- handlers ---
 def handle_manifest():
     base = _public_base_holder.get("base") or ""
     return {
         "id": ADDON_ID,
         "version": VERSION,
         "name": "RareToons 2.0",
-        "description": ("Anime & toons in Hindi / Tamil / Telugu — rebuilt "
-                        "from scratch. In-app playback + site player fallback."),
+        "description": ("Anime & toons in Hindi / Tamil / Telugu — MQ "
+                        "player streams in-app as HLS (multi-quality), "
+                        "plus other-catalog support."),
         "logo": (base + "/logo.png") if base else "https://5a16d5684c14-raretoons.baby-beamup.club/logo.png",
         "background": None,
         "types": ["movie", "series"],
@@ -526,10 +400,9 @@ def handle_meta(mtype, mid):
 
 
 def handle_stream(mtype, mid):
-    """Streams for our own ids (raretoons2:...) AND foreign ids
-    (tt... from other catalogs' metas, resolved via Cinemeta).
-    v2.1.0: ONE card per language - the site's MQ player - exactly the
-    path that plays; V1/V2/V3 mirror cards were dropped."""
+    """ONE MQ card per language, in-app HLS when resolvable in budget,
+    otherwise the argon embed page (browser autoplay).  Foreign tt-ids
+    (other catalogs) resolve through Cinemeta title matching."""
     parts = mid.split(":")
     s_filter = e_filter = None
     rec = None
@@ -556,111 +429,179 @@ def handle_stream(mtype, mid):
     rows = _rows_for(rec, s_filter, e_filter)
     if not rows:
         return {"streams": []}
+    base = _public_base_holder.get("base") or ""
     prefix = (f"S{s_filter:02d}E{e_filter:02d}" if s_filter is not None
               else f"E{(rows[0].get('episode') or 1):02d}")
     ep_title = rows[0].get("ep_title") or rec["name"]
-    streams, seen, langs = [], set(), set()
+
+    picks = {}
     for r in rows:
         lang = _lang_label(r.get("lang"))
-        if lang in langs:
-            continue
         z = r.get("mq") or r.get("sb")
-        if not z:
-            continue
-        langs.add(lang)
-        c = _mq_card(prefix, ep_title, lang, z)
-        if c["url"] not in seen:
-            seen.add(c["url"])
-            streams.append(c)
+        if z and lang not in picks:
+            picks[lang] = z
+    if not picks:
+        return {"streams": []}
+    resolved = _mq_resolve_many(list(picks.values()))
+
+    streams, seen = [], set()
+    for lang, z in picks.items():
+        master, embed = resolved.get(z, (None, None))
+        if master:
+            url = f"{base}/mq/{_mq_token(z)}.m3u8"
+            streams.append({
+                "name": f"RT2 • {lang} • MQ",
+                "title": f"{prefix} • {ep_title} — MultiQuality (HLS, in-app)",
+                "description": (f"{prefix}\n◈ {lang}\n◈ MQ 1080p/720p/360p "
+                                "\n◈ plays inside the app"),
+                "url": url,
+                "behaviorHints": {
+                    "notWebReady": False,
+                    "bingeGroup": f"rt2|mq|{lang.lower()}",
+                    "filename": f"{prefix}.m3u8",
+                },
+            })
+        else:
+            # no HLS in budget: the show hub is the site's own working UI
+            # (some language links sit behind its 3-step link-scan wall,
+            # so a bare zipper would land on the ad interstitial)
+            target = embed or rec.get("hub") or z
+            streams.append({
+                "name": f"RT2 • {lang} • MQ",
+                "title": f"{prefix} • {ep_title} — MultiQuality (site player)",
+                "description": (f"{prefix}\n◈ {lang}\n◈ opens the show page "
+                                "on the site (pick the episode there)"),
+                "url": target,
+                "externalUrl": target,
+                "behaviorHints": {"notWebReady": True},
+            })
     return {"streams": streams}
 
 
 _public_base_holder = {}
 
-# ------------------------------------------------------- /s/ byte proxy ----
-_pick_cache = {}
-_pick_lock = threading.Lock()
+# ----------------------------------------------------- /mq HLS rewriter ----
+_B64_RE = r"[A-Za-z0-9_\-]"
 
 
-
-def _stream_proxy(handler, zipper, index, ext):
-    """Byte-range proxy with validation + failover + range normalizer.
-    Media bytes flow through the addon - the path that plays everywhere."""
-    sources = resolve_zipper(zipper)
-    if not sources:
-        handler._send({"error": "stream unavailable - open the "
-                                "Site Player card"}, 502)
-        return
-    order = []
-    if 0 <= index < len(sources):
-        order.append(index)
-    order += [i for i in range(len(sources)) if i != index]
-    # candidate loop: peek the first chunk; an HTML body means the origin
-    # handed us a player page instead of a file -> fail over to next.
-    for i in order:
-        cand = sources[i]["url"]
-        up = None
-        try:
-            rng0 = handler.headers.get("Range")
-            up = plain_get(cand, rng=rng0, timeout=30)
-            if up.status_code not in (200, 206, 416):
-                up.close()
-                continue
-            peek = b""
-            for ch in up.iter_content(64 * 1024):
-                peek = ch[:16]
-                break
-            if peek.lstrip()[:4] in (b"<!DO", b"<htm", b"<?xm", b"<html"):
-                up.close()
-                handler.log_message("html-pass %s -> next", cand[:60])
-                continue
-            _relay(handler, up, peek, ext, cand, rng0)
-            return
-        except (BrokenPipeError, ConnectionResetError):
-            return
-        except Exception:
-            if up:
-                up.close()
-            continue
-    handler._send({"error": "all servers refused"}, 502)
+def _u64(text):
+    return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
 
 
-def _relay(handler, up, first_chunk, ext, target, rng):
-    """Stream an already-opened upstream (first chunk peeked) with the
-    Range normalizer for 200-full answers."""
-    code = up.status_code
-    ctype = up.headers.get("Content-Type")
-    if not ctype or "text" in ctype.lower() or "octet-stream" in ctype.lower():
-        ctype = CONTENT_TYPES.get(ext, ctype or "video/mp4")
-    total_s = up.headers.get("Content-Length") or ""
-    total = int(total_s) if total_s.isdigit() else 0
-
-    def _headers(cl, cr=None):
-        handler.send_response(206 if cr else code)
-        handler.send_header("Content-Type", ctype)
-        if cr:
-            handler.send_header("Content-Range", cr)
-        if cl:
-            handler.send_header("Content-Length", str(cl))
-        handler.send_header("Accept-Ranges", "bytes")
-        handler.send_header("Access-Control-Allow-Origin", "*")
-        handler.send_header("Access-Control-Expose-Headers",
-                            "Content-Length, Content-Range, Accept-Ranges")
-        handler.send_header("Cache-Control", "no-store")
-        handler.send_header("Connection", "close")
-        handler.end_headers()
-
-    def _chunks():
-        if first_chunk:
-            yield first_chunk
-        for ch in up.iter_content(256 * 1024):
-            if ch:
-                yield ch
-
+def _u64d(text):
     try:
-        if code == 200 and rng:
-            m2 = re.match(r"\s*bytes=(\d*)-(\d*)", rng or "")
-            if m2 and (m2.group(1) or m2.group(2)) and total > 0:
+        return base64.urlsafe_b64decode(
+            text + "=" * (-len(text) % 4)).decode()
+    except Exception:
+        return ""
+
+
+_URL_ATTR_RE = re.compile(r'URI="([^"]+)"')
+
+
+def _rewrite_m3u8(text, base_url, proxy_prefix):
+    """Rewrite every URI in an HLS playlist to same-origin /mq/u/<b64>.
+    Handles absolute + relative URLs, variant lines, segment lines and
+    URI="..." attributes (keys / maps / subtitles)."""
+    out = []
+    for line in text.splitlines():
+        ls = line.strip()
+        if not ls:
+            continue
+        if ls.startswith("#EXT-X-KEY") or ls.startswith("#EXT-X-MAP") \
+                or ls.startswith("#EXT-X-MEDIA") or ls.startswith("#EXT-X-I-FRAME"):
+            def _attr(mm):
+                u = urljoin(base_url, mm.group(1))
+                ext = ".key" if "KEY" in ls[:12] else ".bin"
+                return f'URI="{proxy_prefix}/u/{_u64(u)}{ext}"'
+            out.append(_URL_ATTR_RE.sub(_attr, ls))
+        elif ls.startswith("#"):
+            out.append(ls)
+        else:
+            u = urljoin(base_url, ls)
+            ext = ".m3u8" if u.lower().find(".m3u8") >= 0 else ".ts"
+            out.append(f"{proxy_prefix}/u/{_u64(u)}{ext}")
+    return "\n".join(out) + "\n"
+
+
+def _serve_m3u8_master(handler, zipper):
+    master, _ = _mq_resolve(zipper)
+    if not master:
+        handler._send({"error": "MQ stream not available - retry or use "
+                                "the site-player card"}, 502)
+        return
+    try:
+        r = cf_get(master, referer="https://argon.razorshell.space/")
+        if r.status_code != 200:
+            # signed URL may have expired - refresh once
+            with _hls_lock:
+                _hls_cache.pop(zipper, None)
+            master, _ = _mq_resolve(zipper)
+            if not master:
+                handler._send({"error": "MQ expired"}, 502)
+                return
+            r = cf_get(master, referer="https://argon.razorshell.space/")
+            if r.status_code != 200:
+                handler._send({"error": f"master {r.status_code}"}, 502)
+                return
+        body = _rewrite_m3u8(r.text or "", master,
+                             f"/mq/{_mq_token(zipper)}").encode()
+        handler._send_raw(body, CONTENT_TYPES[".m3u8"])
+    except Exception as exc:
+        handler._send({"error": f"master: {exc}"}, 502)
+
+
+def _serve_m3u8_child(handler, zipper, b64url, ext):
+    target = _u64d(b64url)
+    if not target.startswith("http"):
+        handler._send({"error": "bad child"}, 400)
+        return
+    proxy_prefix = f"/mq/{_mq_token(zipper)}"
+    rng = handler.headers.get("Range")
+    try:
+        # Variant/media playlists must be REWRITTEN too (their segment and
+        # child-playlist URIs point at the CF-protected CDN); media files
+        # stream straight through.
+        if ext == ".m3u8":
+            r = cf_get(target, referer="https://argon.razorshell.space/",
+                       timeout=20)
+            if r.status_code != 200:
+                handler._send({"error": f"playlist {r.status_code}"}, 502)
+                return
+            body = _rewrite_m3u8(r.text or "", target, proxy_prefix).encode()
+            handler._send_raw(body, CONTENT_TYPES[".m3u8"])
+            return
+        up = cf_stream(target, referer="https://argon.razorshell.space/",
+                       rng=rng, timeout=30)
+        code = up.status_code
+        if code not in (200, 206, 416):
+            handler._send({"error": f"child {code}"}, 502)
+            return
+        ctype = up.headers.get("Content-Type")
+        if not ctype or "text/html" in ctype.lower():
+            ctype = CONTENT_TYPES.get(ext, "application/octet-stream")
+        total_s = up.headers.get("Content-Length") or ""
+        total = int(total_s) if total_s.isdigit() else 0
+        cr = up.headers.get("Content-Range")
+
+        def _headers(cl, crng=None):
+            handler.send_response(206 if crng else code)
+            handler.send_header("Content-Type", ctype)
+            if crng:
+                handler.send_header("Content-Range", crng)
+            if cl:
+                handler.send_header("Content-Length", str(cl))
+            handler.send_header("Accept-Ranges", "bytes")
+            handler.send_header("Access-Control-Allow-Origin", "*")
+            handler.send_header("Access-Control-Expose-Headers",
+                                "Content-Length, Content-Range, Accept-Ranges")
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+
+        # normalizer: origin ignored Range (200 + full body) -> slice
+        if code == 200 and rng and total > 0:
+            m2 = re.match(r"\s*bytes=(\d*)-(\d*)", rng)
+            if m2 and (m2.group(1) or m2.group(2)):
                 start = int(m2.group(1)) if m2.group(1) else 0
                 end = int(m2.group(2)) if m2.group(2) else total - 1
                 if start < total:
@@ -669,7 +610,15 @@ def _relay(handler, up, first_chunk, ext, target, rng):
                     _headers(need, f"bytes {start}-{end}/{total}")
                     if not handler._is_head:
                         skip, left = start, need
-                        for ch in _chunks():
+                        first = True
+                        for ch in up.iter_content(256 * 1024):
+                            if not ch:
+                                continue
+                            if first:
+                                # html guard: origin sent a page, not media
+                                if ch.lstrip()[:4] in (b"<!DO", b"<htm"):
+                                    return
+                                first = False
                             if skip:
                                 if len(ch) <= skip:
                                     skip -= len(ch)
@@ -681,17 +630,29 @@ def _relay(handler, up, first_chunk, ext, target, rng):
                                 ch = ch[:left]
                             handler.wfile.write(ch)
                             left -= len(ch)
-                    handler.log_message("norm %s %d-%d", target[:50], start, end)
                     return
-        _headers(total if code == 200 else None,
-                 up.headers.get("Content-Range"))
+        first = True
+        _headers(total if code == 200 else None, cr)
         if not handler._is_head:
-            for ch in _chunks():
+            for ch in up.iter_content(256 * 1024):
+                if not ch:
+                    continue
+                if first:
+                    # html guard: origin sent a page, not media
+                    if ch.lstrip()[:4] in (b"<!DO", b"<htm"):
+                        return
+                    first = False
                 handler.wfile.write(ch)
     except (BrokenPipeError, ConnectionResetError):
         pass
+    except Exception as exc:
+        try:
+            handler._send({"error": f"child: {exc}"}, 502)
+        except Exception:
+            pass
 
 
+# ------------------------------------------------------------- http server -
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "RareToons2"
@@ -723,11 +684,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._is_head = False
         parsed = urlparse(self.path)
-        path = unquote(parsed.path).rstrip("/") or "/"
+        path = unquote(parsed.path)
         qs = parse_qs(parsed.query)
         _public_base_holder["base"] = public_base_from(self)
         try:
-            if path in ("", "/"):
+            if path.rstrip("/") in ("", "/"):
                 self._send({"addon": "RareToons 2.0", "version": VERSION,
                             "status": "ok",
                             "series": len(SERIES), "movies": len(MOVIES),
@@ -761,20 +722,30 @@ class Handler(BaseHTTPRequestHandler):
                            200 if meta else 404)
                 return
 
-            m = re.match(r"^/stream/(series|movie)/(raretoons2:[^/]+|tt\d+(?::\d+)*)\.json$",
-                         path)
+            m = re.match(r"^/stream/(series|movie)/"
+                         r"(raretoons2:[^/]+|tt\d+(?::\d+)*)\.json$", path)
             if m:
                 self._send(handle_stream(m.group(1), m.group(2)))
                 return
 
-            m = re.match(r"^/s/([A-Za-z0-9_\-]+)(\.[A-Za-z0-9]{1,5})?$", path)
+            m = re.match(rf"^/mq/({_B64_RE}+)\.m3u8$", path)
             if m:
-                zipper, idx = _decode_token(m.group(1))
+                zipper = _mq_decode_token(m.group(1))
                 if not zipper.startswith("https://codedew.com/"):
                     self._send({"error": "bad token"}, 400)
                     return
-                t0 = time.time()
-                _stream_proxy(self, zipper, idx, (m.group(2) or ".mkv").lower())
+                _serve_m3u8_master(self, zipper)
+                return
+
+            m = re.match(rf"^/mq/({_B64_RE}+)/u/({_B64_RE}+)"
+                         rf"(\.[A-Za-z0-9]{{1,5}})?$", path)
+            if m:
+                zipper = _mq_decode_token(m.group(1))
+                if not zipper.startswith("https://codedew.com/"):
+                    self._send({"error": "bad token"}, 400)
+                    return
+                _serve_m3u8_child(self, zipper, m.group(2),
+                                  (m.group(3) or ".ts").lower())
                 return
             self._send({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
