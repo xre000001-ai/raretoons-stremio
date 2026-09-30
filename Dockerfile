@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY addon.py episodes_index.jsonl streams.json ./
+COPY addon.py episodes_index.jsonl ./
 
 # Hugging Face Spaces / Render set PORT themselves; default keeps local dev simple
 # TMDB API key - can be overridden via env TMDB_API_KEY or URL prefix /{key}/manifest.json
