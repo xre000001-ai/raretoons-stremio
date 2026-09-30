@@ -68,7 +68,7 @@ SRC_TTL = _env_int("SRC_TTL", 600)                   # zipper→sources cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 MAX_SERVERS = 3                                       # V1..V3 in-app cards
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 ADDON_ID = "community.raretoons2"
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -350,6 +350,99 @@ def _browser_only_card(prefix, ep_title, lang, zipper):
 
 
 # -------------------------------------------------------------- handlers ---
+def _mq_card(prefix, ep_title, lang, zipper):
+    """The one card per language: the site's own MultiQuality player.
+    This is the path that plays everywhere (in Stremio's player), so the
+    V1/V2/V3 in-app mirror cards were dropped in v2.1.0 on user request."""
+    lang_l = _lang_label(lang)
+    return {
+        "name": f"RT2 • {lang_l} • MQ",
+        "title": f"{prefix} • {ep_title} — MultiQuality (site player)",
+        "description": f"{prefix}\n◈ {lang_l}\n◈ MQ player — plays in app",
+        "url": zipper,
+        "externalUrl": zipper,
+        "behaviorHints": {"notWebReady": True},
+    }
+
+
+# -------------------------------------------------- other-catalog streams --
+# Stremio asks us for streams with foreign ids too (tt... from Cinemeta's
+# catalogs).  Resolve the title via the free public Cinemeta API and fuzzy-
+# match it against the site index, so streams appear on OTHER catalogs too
+# (v2.1.0, user request).  No API key needed.
+_CINEMETA = "https://v3-cinemeta.strem.io/meta/{t}/{id}.json"
+_cine_cache = {}
+_cine_lock = threading.Lock()
+
+
+def _cinemeta_name(mtype, ext_id):
+    now = time.time()
+    key = (mtype, ext_id)
+    with _cine_lock:
+        hit = _cine_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    name = None
+    try:
+        r = requests.get(_CINEMETA.format(t=mtype, id=ext_id), timeout=6,
+                         headers={"User-Agent": UA, "Accept": "application/json"})
+        if r.status_code == 200:
+            name = (r.json().get("meta") or {}).get("name")
+    except Exception:
+        name = None
+    with _cine_lock:
+        _cine_cache[key] = (now + (6 * 3600 if name else 90), name)
+    return name
+
+
+def _norm_title(t):
+    return re.sub(r"[^a-z0-9]+", "", (t or "").lower())
+
+
+def _base_title(rec):
+    n = rec["name"]
+    n = re.sub(r"\s*[-–]?\s*(hindi|tamil|telugu|multi)\b.*$", "", n, flags=re.I)
+    n = re.sub(r"\s*season\s*\d+\s*$", "", n, flags=re.I)
+    return n.strip(" -–")
+
+
+def _match_show(title, season):
+    tn = _norm_title(title)
+    if len(tn) < 4:
+        return None
+    best, best_score = None, -1
+    for rec in SHOWS.values():
+        bn = _norm_title(_base_title(rec))
+        if not bn:
+            continue
+        if len(min(bn, tn, key=len)) < 4 and bn != tn:
+            continue
+        if bn in tn or tn in bn:
+            has = season is None or any(k[0] == season for k in rec["eps"])
+            score = (2 if has else 0) + (3 if bn == tn else 0)
+            if score > best_score:
+                best, best_score = rec, score
+    return best
+
+
+def _rows_for(rec, s_filter, e_filter):
+    eps = rec["eps"]
+    if rec["movie"]:
+        return eps.get((0, 1)) or next(iter(eps.values()), [])
+    if s_filter is None:
+        for k in sorted(eps):
+            return eps[k]
+        return []
+    rows = (eps.get((s_filter, e_filter)) or eps.get((0, e_filter))
+            or eps.get((1, e_filter)) or [])
+    if not rows:
+        for (s0, e0), v in sorted(eps.items()):
+            if e0 == e_filter:
+                rows = v
+                break
+    return rows
+
+
 def handle_manifest():
     base = _public_base_holder.get("base") or ""
     return {
@@ -362,7 +455,7 @@ def handle_manifest():
         "background": None,
         "types": ["movie", "series"],
         "resources": ["catalog", "meta", "stream"],
-        "idPrefixes": ["raretoons2"],
+        "idPrefixes": ["raretoons2", "tt"],
         "catalogs": [
             {"type": "series", "id": "rt2_series", "name": "RareToons Series",
              "extra": [{"name": "search", "isRequired": False},
@@ -433,57 +526,52 @@ def handle_meta(mtype, mid):
 
 
 def handle_stream(mtype, mid):
-    if mid.startswith("raretoons2:"):
-        mid = mid[len("raretoons2:"):]
-    slug = mid
+    """Streams for our own ids (raretoons2:...) AND foreign ids
+    (tt... from other catalogs' metas, resolved via Cinemeta).
+    v2.1.0: ONE card per language - the site's MQ player - exactly the
+    path that plays; V1/V2/V3 mirror cards were dropped."""
     parts = mid.split(":")
     s_filter = e_filter = None
-    if len(parts) >= 3:
-        try:
-            s_filter, e_filter = int(parts[-2]), int(parts[-1])
-            slug = ":".join(parts[:-2])
-        except ValueError:
-            pass
-    rec = SHOWS.get(slug)
+    rec = None
+    if mid.startswith("raretoons2:"):
+        p2 = mid[len("raretoons2:"):].split(":")
+        rec = SHOWS.get(p2[0])
+        if len(p2) >= 3:
+            try:
+                s_filter, e_filter = int(p2[-2]), int(p2[-1])
+            except ValueError:
+                pass
+    elif parts and parts[0].startswith("tt"):
+        if len(parts) >= 3:
+            try:
+                s_filter, e_filter = int(parts[-2]), int(parts[-1])
+            except ValueError:
+                pass
+        title = _cinemeta_name(mtype, parts[0])
+        rec = _match_show(title, s_filter) if title else None
+    else:
+        return {"streams": []}
     if not rec:
         return {"streams": []}
-    rows = []
-    for (s, e), bucket in rec["eps"].items():
-        if s_filter is not None and (s, e) != (s_filter, e_filter):
-            continue
-        rows.extend(bucket)
+    rows = _rows_for(rec, s_filter, e_filter)
     if not rows:
         return {"streams": []}
-
-    base = _public_base_holder.get("base") or ""
     prefix = (f"S{s_filter:02d}E{e_filter:02d}" if s_filter is not None
               else f"E{(rows[0].get('episode') or 1):02d}")
     ep_title = rows[0].get("ep_title") or rec["name"]
-
-    # one zipper per language row (sb preferred, else mq), resolved parallel
-    picks = {}
+    streams, seen, langs = [], set(), set()
     for r in rows:
         lang = _lang_label(r.get("lang"))
-        z = r.get("sb") or r.get("mq")
-        if z and lang not in picks:
-            picks[lang] = z
-    resolved = resolve_many(list(picks.values()))
-
-    streams, seen = [], set()
-    for lang, z in picks.items():
-        srcs = resolved.get(z) or []
-        if srcs:
-            for c in _cards_for_zipper(base, prefix, ep_title, lang, z, srcs):
-                k = (c.get("title"), c.get("url"))
-                if k not in seen:
-                    seen.add(k)
-                    streams.append(c)
-        else:
-            for c in _browser_only_card(prefix, ep_title, lang, z):
-                k = (c.get("title"), c.get("url"))
-                if k not in seen:
-                    seen.add(k)
-                    streams.append(c)
+        if lang in langs:
+            continue
+        z = r.get("mq") or r.get("sb")
+        if not z:
+            continue
+        langs.add(lang)
+        c = _mq_card(prefix, ep_title, lang, z)
+        if c["url"] not in seen:
+            seen.add(c["url"])
+            streams.append(c)
     return {"streams": streams}
 
 
@@ -673,7 +761,7 @@ class Handler(BaseHTTPRequestHandler):
                            200 if meta else 404)
                 return
 
-            m = re.match(r"^/stream/(series|movie)/(raretoons2:[^/]+)\.json$",
+            m = re.match(r"^/stream/(series|movie)/(raretoons2:[^/]+|tt\d+(?::\d+)*)\.json$",
                          path)
             if m:
                 self._send(handle_stream(m.group(1), m.group(2)))
