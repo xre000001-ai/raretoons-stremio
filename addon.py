@@ -1102,6 +1102,20 @@ def _resolve_codedew_zipper(zipper):
         # Strategy B: parse the (possibly server-rendered) player HTML.
         if not res:
             res = _extract_video_from_html(text)
+        # Strategy C (2026-09): the zipper no longer 302s to the player and
+        # the POST API answers {"success":false,"error":"Server busy, try
+        # again"} to non-browser clients. The player page itself
+        # (codedew.com/streambeta/?url=<fileId>) IS server-rendered and
+        # embeds `let playerSources = [...]` with live worker signed URLs,
+        # so just GET it and parse it like any player page.
+        if not res and file_id:
+            try:
+                ph = _http(f"https://codedew.com/streambeta/?url={quote(file_id, safe='')}",
+                           follow=True, referer="https://codedew.com/")
+                if ph.status_code == 200 and ph.text:
+                    res = _extract_video_from_html(ph.text)
+            except Exception:
+                res = None
 
     except Exception:
         res = None
