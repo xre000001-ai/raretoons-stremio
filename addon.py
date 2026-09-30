@@ -51,7 +51,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -468,7 +468,7 @@ def handle_stream(mtype, mid):
             target = embed or rec.get("hub") or z
             streams.append({
                 "name": f"RT2 • {lang} • MQ",
-                "title": f"{prefix} • {ep_title} — MultiQuality (site player)",
+                "title": f"{prefix} • {ep_title} — MQ (opens website)",
                 "description": (f"{prefix}\n◈ {lang}\n◈ opens the show page "
                                 "on the site (pick the episode there)"),
                 "url": target,
@@ -589,8 +589,12 @@ def _serve_m3u8_child(handler, zipper, b64url, ext):
             handler.send_header("Content-Type", ctype)
             if crng:
                 handler.send_header("Content-Range", crng)
+            # Content-Length is MANDATORY here: without it HTTP/1.1 clients
+            # stall until the socket closes (that was the broken seeking).
+            # On 206 the origin's Content-Length IS the body size.
             if cl:
                 handler.send_header("Content-Length", str(cl))
+            handler.send_header("Connection", "close")
             handler.send_header("Accept-Ranges", "bytes")
             handler.send_header("Access-Control-Allow-Origin", "*")
             handler.send_header("Access-Control-Expose-Headers",
@@ -632,7 +636,7 @@ def _serve_m3u8_child(handler, zipper, b64url, ext):
                             left -= len(ch)
                     return
         first = True
-        _headers(total if code == 200 else None, cr)
+        _headers(total if total else None, cr)
         if not handler._is_head:
             for ch in up.iter_content(256 * 1024):
                 if not ch:
