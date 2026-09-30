@@ -3225,7 +3225,7 @@ def get_manifest(api_key=None):
     key_note = f" (TMDB key: {api_key[:6]}...)" if api_key and api_key != DEFAULT_TMDB_KEY else ""
     return {
         "id": "community.raretoons.stremio",
-        "version": "1.13.0",
+        "version": "1.13.1",
         "name": "RareToons (Hindi / Tamil / Telugu)",
         "description": ("Direct file streams (Server v1, v2, v3) from RareToonsIndia "
                         "(rareanimes.com). Links resolve, verify and fail over at "
@@ -3653,7 +3653,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = path.rstrip("/") or "/"
             if path in ("", "/"):
-                self._send({"addon": "RareToons", "version": "1.13.0",
+                self._send({"addon": "RareToons", "version": "1.13.1",
                             "manifest": "/manifest.json",
                             "shows_indexed": len(SHOWS),
                             "stream_config": {
@@ -3682,12 +3682,6 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/manifest.json":
                 self._send(get_manifest(api_key=effective_key))
-                return
-
-            if path == "/hdrdbg":
-                self._send({"protocol": self.request_version,
-                            "command": self.command,
-                            "headers": dict(self.headers.items())})
                 return
 
             if path.startswith("/catalog/"):
