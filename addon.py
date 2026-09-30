@@ -3602,6 +3602,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/manifest.json":
+                try:
+                    dbg = {"host": self.headers.get("Host"), "xfh": self.headers.get("X-Forwarded-Host"),
+                           "xproto": self.headers.get("X-Forwarded-Proto"), "base": self._public_base()}
+                    self.log_message("HDRDBG %s", json.dumps(dbg))
+                except Exception:
+                    pass
                 self._send(get_manifest(api_key=effective_key))
                 return
 
