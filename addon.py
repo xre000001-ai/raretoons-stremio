@@ -3284,7 +3284,7 @@ class Handler(BaseHTTPRequestHandler):
         when we can't know it (localhost dev / unknown proxy scheme). Only
         used to build /watch redirect URLs for players; when unknown we
         serve the verified raw signed URL instead - never a guessed scheme."""
-        host = (self.headers.get("Host") or "").strip()
+        host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "").split(",")[0].strip()
         if not host:
             return None
         h = host.split(":")[0].lower()
