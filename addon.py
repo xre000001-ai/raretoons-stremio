@@ -3684,6 +3684,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(get_manifest(api_key=effective_key))
                 return
 
+            if path == "/hdrdbg":
+                self._send({"protocol": self.request_version,
+                            "command": self.command,
+                            "headers": dict(self.headers.items())})
+                return
+
             if path.startswith("/catalog/"):
                 m = re.match(r"^/catalog/([^/]+)/([^/]+?)(?:/([^/]+))?\.json$", path)
                 if not m:
