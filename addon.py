@@ -1,27 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RareToons 2.2 — Stremio addon (MQ-HLS in-app playback).
+RareToons 2.9 — Stremio addon.  Streams-only, Phoenix-style cards.
 
-v2.2.0 (2026-09-30): the ONLY cards we emit are the site's MultiQuality
-(MQ) player, served IN-APP as HLS.  Verified end-to-end against the site:
+WHAT IT DOES
+  For any id (legacy raretoons2:slug or foreign tt... via Cinemeta) the
+  addon emits ONE card per LANGUAGE that actually plays in-app:
 
-  1. an episode's `mq` zipper (codedew.com/zipper/?url=<fid>) page embeds
-     the player iframe  https://argon.razorshell.space/embed/<id>
-  2. the embed page carries  _juicycodes("<base64 blob>")  — a simple
-     symbol-map cipher (ported to Python below) that decodes to the
-     JWPlayer `var config = {...}` JSON, whose sources.file is the
-     1080p/720p/360p HLS master (groovy.monster, #POWERED-BY JUICYCODES)
-  3. master + variant playlists + MPEG-TS segments all answer 200 to the
-     curl_cffi/impersonate client (plain clients get a CF 403).
+      name   ◫ MQ ◫
+      title  ⧉ <show/movie title> ⌗ <Language>[ · sub]
+             ⬡ Movie | ⬡ S01E05 · <episode title>
+             ⊞ RareToons ◧ MQ 1080·720·360[ · note]
 
-The addon rewrites the whole HLS tree to same-origin /mq/... URLs, so
-Stremio (desktop / Android / web) plays it like any other HLS stream.
+  Languages: Hindi, Tamil, Telugu, Bengali, Malayalam, Urdu, English,
+  Japanese, Anime Times, Hindi Uncut ... (whatever the show's hub has).
+  PLAYABLE-ONLY: a language we cannot resolve to our HLS gets no card.
 
-Cards: ONE per language ("RT2 • Hindi • MQ", ...).  Fallback when the
-chain cannot be resolved in time: the argon embed page itself, which
-autoplays in any browser.  Streams also resolve for foreign ids
-(tt... from other catalogs' metas) via the free Cinemeta API.
+PIPELINE
+  1. episodes_index.jsonl (crawler snapshot) gives first-guess zippers.
+  2. The site ROTATES movie zippers ~hourly and adds new episodes, so
+     on any miss handle_stream/handle_meta re-parse the live hub page
+     (_live_rows -> _absorb_live, TTL 15 min) and retry fresh.
+  3. codedew zipper links (all non-Hindi languages + movies) sit behind
+     a 3-step "Security Scan" wall: _zipper_walk follows the data-href
+     chain with a cookie session (semaphore(3) - codedew rate-limits
+     parallel walks).
+  4. Wall-free pages embed  https://argon.razorshell.space/embed/<id>
+     which carries _juicycodes("<blob>") - symbol-map cipher (ported
+     below) decoding to the JWPlayer config, whose sources.file is the
+     1080p/720p/360p HLS master (groovy.monster, JUICYCODES).
+  5. /mq/... proxies rewrite the whole HLS tree same-origin.  The site's
+     MQ variant playlists are #EXT-X-BYTERANGE slices of ONE resource -
+     exploded to ?rt=start-end so no player ever downloads the whole
+     file (the old "full download" bug).  Content is single-video +
+     single-audio TS by site encoding.
 
 Run:  python3 addon.py [port]     (binds 0.0.0.0)
 """
@@ -51,7 +63,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -258,23 +270,6 @@ def _mq_resolve(zipper):
     return master, embed
 
 
-def _mq_resolve_many(zippers):
-    out = {z: (None, None) for z in zippers}
-    threads = []
-
-    def _run(z):
-        out[z] = _mq_resolve(z)
-
-    for z in zippers:
-        t = threading.Thread(target=_run, args=(z,), daemon=True)
-        t.start()
-        threads.append(t)
-    deadline = time.time() + LIST_BUDGET
-    for t in threads:
-        t.join(max(0.1, deadline - time.time()))
-    return out
-
-
 def public_base_from(handler):
     host = handler.headers.get("Host") or ""
     if "." not in host and HOST_SUFFIX and not host.endswith(HOST_SUFFIX):
@@ -296,6 +291,50 @@ def _mq_decode_token(tok):
 
 
 # ---------------------------------------------------------------- cards ----
+def _clip(t, n):
+    t = re.sub(r"\s+", " ", t or "").strip()
+    if len(t) <= n:
+        return t
+    cut = t[:n]
+    sp = cut.rfind(" ")
+    return cut[:sp] if sp > n // 2 else cut
+
+
+def _phx_card(rec, lang, prefix, ep_title, note, z, base):
+    """Phoenix-style stream card:
+
+        name   ◫ MQ ◫
+        title  ⧉ <title> ⌗ <Language>[ · sub]
+               ⬡ Movie | ⬡ S01E05 · <ep title>
+               ⊞ RareToons ◧ MQ 1080·720·360[ · note]
+    """
+    sub = " · sub" if lang.lower().endswith("sub") else ""
+    lang0 = re.sub(r"\s*sub\s*$", "", lang, flags=re.I).strip() or lang
+    # the hub names carry long "(Hindi Dubbed) ..." tails; the language
+    # badge already says it - keep line 1 clean
+    clean = re.sub(r"\s*\([^)]*(?:Hindi|Download|HD)[^)]*\)\s*$", "",
+                   rec["name"], flags=re.I).strip()
+    line1 = f"⧉ {_clip(clean or rec['name'], 56)} ⌗ {lang0}{sub}"
+    if rec["movie"]:
+        line2 = "⬡ Movie"
+    else:
+        et = ep_title if ep_title and ep_title != rec["name"] else ""
+        line2 = f"⬡ {prefix}" + (f" · {_clip(et, 34)}" if et else "")
+    line3 = "⊞ RareToons ◧ MQ 1080·720·360"
+    if note:
+        line3 += f" · {note}"
+    return {
+        "name": "◫ MQ ◫",
+        "title": f"{line1}\n{line2}\n{line3}",
+        "url": f"{base}/mq/{_mq_token(z)}.m3u8",
+        "behaviorHints": {
+            "notWebReady": False,
+            "bingeGroup": f"rt2|mq|{lang.lower()}",
+            "filename": f"{prefix}.m3u8",
+        },
+    }
+
+
 def _lang_label(raw):
     lang = re.sub(r"\s*(uncut|censored)\s*$", "", raw or "", flags=re.I).strip()
     if not lang or lang.lower() == "default":
@@ -406,30 +445,6 @@ def handle_manifest():
         "catalogs": [],
         "behaviorHints": {"configurable": False},
     }
-
-
-def handle_catalog(ctype, cid, search="", skip=""):
-    pool = SERIES if cid.endswith("series") else MOVIES
-    term = (search or "").strip().lower()
-    if term:
-        pool = [s for s in pool if term in s["site_name"].lower()
-                or term in s["name"].lower()]
-    try:
-        off = max(0, int(skip or 0))
-    except Exception:
-        off = 0
-    metas = []
-    for s in pool[off:off + 100]:
-        metas.append({
-            "id": f"raretoons2:{s['slug']}",
-            "type": "movie" if s["movie"] else "series",
-            "name": s["name"],
-            "poster": s["poster"] or None,
-            "description": (f"{s['name']} — Hindi / Tamil / Telugu dubs via "
-                            "RareToons (site mirror)."),
-        })
-    metas = [m for m in metas if m["poster"]]
-    return {"metas": metas}
 
 
 _EP_POS_RE = re.compile(r"Episode\s*0*(\d{1,3})", re.I)
@@ -673,35 +688,19 @@ def handle_stream(mtype, mid):
         return {"streams": []}
 
     dub_show = "dubbed" in (rec.get("site_name") or "").lower()
-    streams, seen = [], set()
+    streams = []
     for lang, zs in picks.items():
         hit = resolved.get(lang)
         if not hit:
             continue
         master, z = hit[0], hit[1]
-        note = ""
-        if dub_show and lang.lower() == "hindi sub":
-            note = " — site has no dub for this episode yet"
         # PLAYABLE-ONLY policy (user request): a language that cannot be
-        # resolved to our in-app HLS gets NO card at all — dead/website
-        # cards are worse than none.  (Series multi-language files are
-        # download-only on the site, so those simply never appear.)
+        # resolved to our in-app HLS gets NO card at all.
         if not master:
             continue
-        url = f"{base}/mq/{_mq_token(z)}.m3u8"
-        streams.append({
-            "name": f"RT2 • {lang} • MQ",
-            "title": (f"{prefix} • {ep_title} — MultiQuality (HLS, "
-                      f"in-app){note}"),
-            "description": (f"{prefix}\n◈ {lang}\n◈ MQ 1080p/720p/360p "
-                            "\n◈ plays inside the app"),
-            "url": url,
-            "behaviorHints": {
-                "notWebReady": False,
-                "bingeGroup": f"rt2|mq|{lang.lower()}",
-                "filename": f"{prefix}.m3u8",
-            },
-        })
+        note = ("site has no dub for this episode yet"
+                if dub_show and lang.lower() == "hindi sub" else "")
+        streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base))
     return {"streams": streams}
 
 
@@ -985,15 +984,6 @@ class Handler(BaseHTTPRequestHandler):
                     self._send({"error": "no logo"}, 404)
                 return
 
-            m = re.match(r"^/catalog/(series|movie)/rt2_(series|movies)"
-                         r"(?:/([^/]+))?\.json$", path)
-            if m:
-                extra = m.group(3) or ""
-                search = (qs.get("search", [""])[0] if qs else "") or (
-                    extra if "=" not in extra else "")
-                skip = qs.get("skip", [""])[0] if qs else ""
-                self._send(handle_catalog(m.group(1), m.group(2), search, skip))
-                return
 
             m = re.match(r"^/meta/(series|movie)/(raretoons2:.+)\.json$", path)
             if m:
