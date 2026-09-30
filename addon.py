@@ -68,7 +68,7 @@ SRC_TTL = _env_int("SRC_TTL", 600)                   # zipper→sources cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 MAX_SERVERS = 3                                       # V1..V3 in-app cards
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 ADDON_ID = "community.raretoons2"
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -494,89 +494,84 @@ _pick_cache = {}
 _pick_lock = threading.Lock()
 
 
-def _pick_source(zipper, index):
-    """URL to stream for (zipper, index): probe candidates (index first),
-    pin the winner briefly so seeks don't re-probe."""
-    now = time.time()
-    key = (zipper, index)
-    with _pick_lock:
-        hit = _pick_cache.get(key)
-        if hit and hit[0] > now:
-            return hit[1], True
+
+def _stream_proxy(handler, zipper, index, ext):
+    """Byte-range proxy with validation + failover + range normalizer.
+    Media bytes flow through the addon - the path that plays everywhere."""
     sources = resolve_zipper(zipper)
     if not sources:
-        return None, False
+        handler._send({"error": "stream unavailable - open the "
+                                "Site Player card"}, 502)
+        return
     order = []
     if 0 <= index < len(sources):
         order.append(index)
     order += [i for i in range(len(sources)) if i != index]
+    # candidate loop: peek the first chunk; an HTML body means the origin
+    # handed us a player page instead of a file -> fail over to next.
     for i in order:
-        u = sources[i]["url"]
+        cand = sources[i]["url"]
+        up = None
         try:
-            pr = plain_get(u, rng="bytes=0-1024", timeout=8)
-            ok = pr.status_code in (200, 206)
-            first = b""
-            if ok:
-                for ch in pr.iter_content(1024):
-                    first = ch[:4]
-                    break
-            pr.close()
-            if ok and first[:4] not in (b"<!DO", b"<htm", b"<?xm"):
-                with _pick_lock:
-                    _pick_cache[key] = (now + PICK_TTL, i)
-                return i, True
-        except Exception:
-            continue
-    return None, False
-
-
-def _stream_proxy(handler, zipper, index, ext):
-    """Byte-range proxy with normalizer + failover. Media bytes flow
-    through the addon - this is the path that plays everywhere."""
-    idx, _ = _pick_source(zipper, index)
-    sources = resolve_zipper(zipper)
-    if idx is None:
-        if not sources:
-            handler._send({"error": "stream unavailable - open the "
-                                    "Site Player card"}, 502)
-        else:
-            handler._send({"error": "all servers refused"}, 502)
-        return
-    target = sources[idx]["url"]
-    rng = handler.headers.get("Range")
-    req_headers = {"User-Agent": UA, "Accept": "*/*"}
-    if rng:
-        req_headers["Range"] = rng
-    try:
-        up = plain_get(target, rng=rng, timeout=30)
-        code = up.status_code
-        if code not in (200, 206, 416):
-            handler._send({"error": f"upstream {code}"}, 502)
+            rng0 = handler.headers.get("Range")
+            up = plain_get(cand, rng=rng0, timeout=30)
+            if up.status_code not in (200, 206, 416):
+                up.close()
+                continue
+            peek = b""
+            for ch in up.iter_content(64 * 1024):
+                peek = ch[:16]
+                break
+            if peek.lstrip()[:4] in (b"<!DO", b"<htm", b"<?xm", b"<html"):
+                up.close()
+                handler.log_message("html-pass %s -> next", cand[:60])
+                continue
+            _relay(handler, up, peek, ext, cand, rng0)
             return
-        ctype = up.headers.get("Content-Type")
-        if not ctype or "text" in ctype.lower() or "octet-stream" in ctype.lower():
-            ctype = CONTENT_TYPES.get(ext, ctype or "video/mp4")
-        total_s = up.headers.get("Content-Length") or ""
-        total = int(total_s) if total_s.isdigit() else 0
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception:
+            if up:
+                up.close()
+            continue
+    handler._send({"error": "all servers refused"}, 502)
 
-        def _headers(cl, cr=None):
-            handler.send_response(206 if (cr or (rng and code == 206)) else code)
-            handler.send_header("Content-Type", ctype)
-            if cr:
-                handler.send_header("Content-Range", cr)
-            if cl:
-                handler.send_header("Content-Length", str(cl))
-            handler.send_header("Accept-Ranges", "bytes")
-            handler.send_header("Access-Control-Allow-Origin", "*")
-            handler.send_header("Access-Control-Expose-Headers",
-                                "Content-Length, Content-Range, Accept-Ranges")
-            handler.send_header("Cache-Control", "no-store")
-            handler.send_header("Connection", "close")
-            handler.end_headers()
 
-        # normalizer: origin ignored Range -> slice server-side
+def _relay(handler, up, first_chunk, ext, target, rng):
+    """Stream an already-opened upstream (first chunk peeked) with the
+    Range normalizer for 200-full answers."""
+    code = up.status_code
+    ctype = up.headers.get("Content-Type")
+    if not ctype or "text" in ctype.lower() or "octet-stream" in ctype.lower():
+        ctype = CONTENT_TYPES.get(ext, ctype or "video/mp4")
+    total_s = up.headers.get("Content-Length") or ""
+    total = int(total_s) if total_s.isdigit() else 0
+
+    def _headers(cl, cr=None):
+        handler.send_response(206 if cr else code)
+        handler.send_header("Content-Type", ctype)
+        if cr:
+            handler.send_header("Content-Range", cr)
+        if cl:
+            handler.send_header("Content-Length", str(cl))
+        handler.send_header("Accept-Ranges", "bytes")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Access-Control-Expose-Headers",
+                            "Content-Length, Content-Range, Accept-Ranges")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+
+    def _chunks():
+        if first_chunk:
+            yield first_chunk
+        for ch in up.iter_content(256 * 1024):
+            if ch:
+                yield ch
+
+    try:
         if code == 200 and rng:
-            m2 = re.match(r"\s*bytes=(\d*)-(\d*)", rng)
+            m2 = re.match(r"\s*bytes=(\d*)-(\d*)", rng or "")
             if m2 and (m2.group(1) or m2.group(2)) and total > 0:
                 start = int(m2.group(1)) if m2.group(1) else 0
                 end = int(m2.group(2)) if m2.group(2) else total - 1
@@ -586,9 +581,7 @@ def _stream_proxy(handler, zipper, index, ext):
                     _headers(need, f"bytes {start}-{end}/{total}")
                     if not handler._is_head:
                         skip, left = start, need
-                        for ch in up.iter_content(256 * 1024):
-                            if not ch:
-                                continue
+                        for ch in _chunks():
                             if skip:
                                 if len(ch) <= skip:
                                     skip -= len(ch)
@@ -605,19 +598,12 @@ def _stream_proxy(handler, zipper, index, ext):
         _headers(total if code == 200 else None,
                  up.headers.get("Content-Range"))
         if not handler._is_head:
-            for ch in up.iter_content(256 * 1024):
-                if ch:
-                    handler.wfile.write(ch)
+            for ch in _chunks():
+                handler.wfile.write(ch)
     except (BrokenPipeError, ConnectionResetError):
         pass
-    except Exception as exc:
-        try:
-            handler._send({"error": f"proxy: {exc}"}, 502)
-        except Exception:
-            pass
 
 
-# ------------------------------------------------------------- http server -
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "RareToons2"
