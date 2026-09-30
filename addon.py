@@ -51,7 +51,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -177,6 +177,9 @@ _MASTER_RE = re.compile(r'"file":"(https:[^"]+\.m3u8)"')
 _WALL_RE = re.compile(r'data-href="([^"]+)"')
 
 
+_WALK_SEM = threading.Semaphore(3)
+
+
 def _zipper_walk(zipper, max_hops=4, deadline=None):
     """codedew zipper links (all non-Hindi languages, and movies) sit
     behind a 3-step "Security Scan" wall: each wall page carries a
@@ -189,6 +192,16 @@ def _zipper_walk(zipper, max_hops=4, deadline=None):
     url = zipper
     t = ""
     for _ in range(max_hops + 1):
+        # codedew rate-limits parallel wall-walks (busy interstitials) -
+        # throttle globally; NEG_TTL makes dropped ones retry soon.
+        with _WALK_SEM:
+            if deadline and time.monotonic() > deadline:
+                return t, None          # resolve budget exhausted - no card
+            r = sess.get(url, headers={"User-Agent": UA, "Accept": "*/*",
+                                       "Accept-Language": "en-US,en;q=0.9",
+                                       "Referer": prev},
+                         timeout=RESOLVE_TIMEOUT, allow_redirects=True)
+        t = r.text or ""
         if deadline and time.monotonic() > deadline:
             return t, None          # resolve budget exhausted - no card
         r = sess.get(url, headers={"User-Agent": UA, "Accept": "*/*",
@@ -419,6 +432,132 @@ def handle_catalog(ctype, cid, search="", skip=""):
     return {"metas": metas}
 
 
+_EP_POS_RE = re.compile(r"Episode\s*0*(\d{1,3})", re.I)
+_LANG_ZIP_RE = re.compile(r"color:\s*#[0-9a-fA-F]+;?[^>]*>\s*([A-Za-z][A-Za-z ]{1,18})"
+                          r"\s*</span>[^<]{0,60}?<a[^>]+href=\"([^\"]*codedew\.com/zipper[^\"]*)\"",
+                          re.S)
+_HUB_ZIP_RE = re.compile(r'href="(https://codedew\.com/zipper/\?url=[^"]+)"')
+_LIVE_LANGS = ("Hindi", "Tamil", "Telugu", "English", "Japanese",
+               "Bengali", "Malayalam", "Urdu")
+_LIVE_TTL = _env_int("LIVE_TTL", 900)      # fresh hub parse validity
+_LIVE_NEG = _env_int("LIVE_NEG", 240)
+_live_cache = {}                            # hub -> (expires, rows)
+
+
+def _live_rows(rec):
+    """Re-parse the show's hub page on the site.  This is the freshness
+    path: brand-new episodes AND rotated movie zippers appear without a
+    redeploy.  Episode hubs expose  <color span>Language</span><a zipper>;
+    movie hubs expose  'Hindi - Download' / 'Tamil - [ WatchMultiQuality ]'
+    style button blocks (HubCloud/DLBeta/4k/GB rows are download-only and
+    skipped)."""
+    hub = rec.get("hub")
+    if not hub:
+        return []
+    now = time.time()
+    with _hls_lock:
+        hit = _live_cache.get(hub)
+        if hit and hit[0] > now:
+            return hit[1]
+    rows = []
+    try:
+        t = cf_get(hub, referer=SEG_SITE).text or ""
+        if rec.get("movie"):
+            for mm in _HUB_ZIP_RE.finditer(t):
+                ctx = re.sub(r"<[^>]+>", " ", t[max(0, mm.start() - 300):mm.start()])
+                ctx = re.sub(r"\s+", " ", ctx).strip()
+                if not any(b in ctx for b in ("WatchMultiQuality", "WatchNow",
+                                              "Download")):
+                    continue
+                for L in _LIVE_LANGS:
+                    if re.search(rf"\b{L}\b", ctx, re.I):
+                        rows.append({"show": rec["site_name"], "season": 0,
+                                     "episode": 1, "ep_title": "", "lang": L,
+                                     "hub_url": hub, "mq": mm.group(1),
+                                     "sb": ""})
+                        break
+        else:
+            eps = [(mm.start(), int(mm.group(1))) for mm in _EP_POS_RE.finditer(t)]
+            for lm in _LANG_ZIP_RE.finditer(t):
+                ep = 0
+                for pos, n in eps:
+                    if pos < lm.start():
+                        ep = n
+                    else:
+                        break
+                if not ep:
+                    continue
+                rows.append({"show": rec["site_name"], "season": None,
+                             "episode": ep, "ep_title": "",
+                             "lang": lm.group(1).strip(), "hub_url": hub,
+                             "mq": lm.group(2), "sb": ""})
+    except Exception:
+        rows = []
+    with _hls_lock:
+        _live_cache[hub] = (now + (_LIVE_TTL if rows else _LIVE_NEG), rows)
+    return rows
+
+
+def _absorb_live(rec, live_rows, s_filter=None):
+    """merge live hub rows into rec['eps'] live-first, so rotated zippers
+    are replaced by fresh ones and unseen episodes become visible."""
+    if not live_rows:
+        return
+    buckets = {}
+    for r in live_rows:
+        if rec["movie"]:
+            key = (0, 1)
+        else:
+            s0 = s_filter or r.get("season")
+            if not s0:
+                s0 = (next(iter(rec["eps"]))[0] if rec["eps"] else 1)
+            key = (s0, r.get("episode") or 1)
+        r["season"] = key[0]
+        buckets.setdefault(key, []).append(r)
+    with _hls_lock:
+        for key, rs in buckets.items():
+            langs = {r.get("lang") for r in rs}
+            old = rec["eps"].get(key, [])
+            # all fresh candidates first (document order - resolve tries
+            # them in sequence), then untouched leftovers
+            rec["eps"][key] = rs + [o for o in old
+                                    if o.get("lang") not in langs]
+    return
+
+
+def _resolve_picks(picks, done=None, budget=18.0):
+    """{lang: [zippers]} -> {lang: (master, zipper)}.  One thread per
+    language (wall-walks are I/O bound), up to three zippers per
+    language, all inside one shared time budget."""
+    out = {}
+    if not picks:
+        return out
+    deadline = time.monotonic() + budget
+    lock = threading.Lock()
+
+    def _run(lang, zs):
+        if done and lang in done:
+            with lock:
+                out[lang] = done[lang]
+            return
+        for z in zs[:3]:
+            if time.monotonic() > deadline:
+                return
+            master, embed = _mq_resolve(z)
+            if master:
+                with lock:
+                    out[lang] = (master, z)
+                return
+
+    threads = [threading.Thread(target=_run, args=(l, zs), daemon=True)
+               for l, zs in picks.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.1, deadline - time.monotonic()) + 1.0)
+    return out
+
+
 def handle_meta(mtype, mid):
     slug = mid.split(":", 1)[1] if ":" in mid else mid
     rec = SHOWS.get(slug)
@@ -436,6 +575,10 @@ def handle_meta(mtype, mid):
         "videos": [],
     }
     if not rec["movie"]:
+        try:
+            _absorb_live(rec, _live_rows(rec))
+        except Exception:
+            pass
         vids = []
         for (s, e), rows in sorted(rec["eps"].items()):
             if not s:
@@ -481,30 +624,61 @@ def handle_stream(mtype, mid):
         return {"streams": []}
     rows = _rows_for(rec, s_filter, e_filter)
     if not rows:
+        # maybe a brand-new episode the static index never saw
+        _absorb_live(rec, _live_rows(rec), s_filter)
+        rows = _rows_for(rec, s_filter, e_filter)
+    if not rows:
         return {"streams": []}
     base = _public_base_holder.get("base") or ""
     prefix = (f"S{s_filter:02d}E{e_filter:02d}" if s_filter is not None
               else f"E{(rows[0].get('episode') or 1):02d}")
     ep_title = rows[0].get("ep_title") or rec["name"]
 
-    picks = {}
     order = {"Hindi": 0, "Hindi Uncut": 1, "Tamil": 2, "Telugu": 3,
              "Bengali": 4, "Malayalam": 5, "Urdu": 6, "English": 7,
              "Hindi Sub": 8}
-    for r in rows:
-        lang = _lang_label(r.get("lang"))
-        z = r.get("mq") or r.get("sb")
-        if z and lang not in picks:
-            picks[lang] = z
-    picks = {k: picks[k] for k in sorted(picks, key=lambda k: order.get(k, 50))}
+
+    def _picks(rs):
+        p = {}
+        for r in rs:
+            lang = _lang_label(r.get("lang"))
+            z = r.get("mq") or r.get("sb")
+            if z:
+                lst = p.setdefault(lang, [])
+                if z not in lst:
+                    lst.append(z)
+        return {k: p[k] for k in sorted(p, key=lambda k: order.get(k, 50))}
+
+    picks = _picks(rows)
     if not picks:
         return {"streams": []}
-    resolved = _mq_resolve_many(list(picks.values()))
+    resolved = _resolve_picks(picks)
+    # freshness: a language failed to resolve (the site rotates movie
+    # zippers) or the requested episode was missing -> re-parse the live
+    # hub once and retry with fresh zippers.
+    has_req = any((s_filter is None or (r.get("season") or 1) == s_filter)
+                  and (e_filter is None or (r.get("episode") or 1) == e_filter)
+                  for r in rows)
+    if (not has_req or len(resolved) < len(picks)):
+        try:
+            live = _live_rows(rec)
+        except Exception:
+            live = []
+        if live:
+            _absorb_live(rec, live, s_filter)
+            rows = _rows_for(rec, s_filter, e_filter)
+            picks = _picks(rows)
+            resolved = _resolve_picks(picks, done=resolved)
+    if not resolved:
+        return {"streams": []}
 
     dub_show = "dubbed" in (rec.get("site_name") or "").lower()
     streams, seen = [], set()
-    for lang, z in picks.items():
-        master, embed = resolved.get(z, (None, None))
+    for lang, zs in picks.items():
+        hit = resolved.get(lang)
+        if not hit:
+            continue
+        master, z = hit[0], hit[1]
         note = ""
         if dub_show and lang.lower() == "hindi sub":
             note = " — site has no dub for this episode yet"
