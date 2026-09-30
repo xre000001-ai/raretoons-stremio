@@ -3605,10 +3605,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     dbg = {"host": self.headers.get("Host"), "xfh": self.headers.get("X-Forwarded-Host"),
                            "xproto": self.headers.get("X-Forwarded-Proto"), "base": self._public_base()}
-                    self.log_message("HDRDBG %s", json.dumps(dbg))
+                    self._last_dbg = dbg
                 except Exception:
                     pass
-                self._send(get_manifest(api_key=effective_key))
+                mj = get_manifest(api_key=effective_key)
+                try: mj["x-hdrdbg"] = getattr(self, "_last_dbg", None)
+                except Exception: pass
+                self._send(mj)
                 return
 
             if path.startswith("/catalog/"):
