@@ -63,7 +63,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -380,30 +380,58 @@ def _norm_title(t):
 
 
 def _base_title(rec):
+    """Franchise key: no season, no (…)/language/dub tails - works on
+    every hub-title shape ("Season 2 Hindi Episodes ...", "Season 1
+    Hindi Dubbed ...", "Season 4 (Hashira Training Arc) ...")."""
     n = rec["name"]
-    n = re.sub(r"\s*[-–]?\s*(hindi|tamil|telugu|multi)\b.*$", "", n, flags=re.I)
-    n = re.sub(r"\s*season\s*\d+\s*$", "", n, flags=re.I)
+    n = re.sub(r"\([^)]*\)", " ", n)
+    n = re.sub(r"\s*[-–]?\s*(hindi|tamil|telugu|malayalam|bengali|multi|"
+               r"dubbed|subbed|dub|sub|uncut|crunchyroll|jio\s*cinema)\b.*$",
+               "", n, flags=re.I)
+    n = re.sub(r"\bseason\s*\d+\b", " ", n, flags=re.I)
+    n = re.sub(r"\bepisodes\b", " ", n, flags=re.I)
+    n = re.sub(r"\s+", " ", n)
     return n.strip(" -–")
 
 
 def _match_show(title, season):
+    """Franchise match: all hubs whose base title matches the Cinemeta
+    title, then pick the hub for the REQUESTED season.  No hub with
+    that season -> None (no cards beats wrong-season episodes).  When
+    both a Subbed and a Dubbed hub carry the season, prefer Dubbed."""
     tn = _norm_title(title)
     if len(tn) < 4:
         return None
-    best, best_score = None, -1
+    cands, exact_base = [], []
     for rec in SHOWS.values():
         bn = _norm_title(_base_title(rec))
         if not bn:
             continue
-        if bn in tn or tn in bn:
-            has = season is None or any(k[0] == season for k in rec["eps"])
-            score = (2 if has else 0) + (3 if bn == tn else 0)
-            sn = (rec.get("site_name") or "").lower()
-            if "subbed" not in sn:          # prefer the Dubbed variant
-                score += 1
-            if score > best_score:
-                best, best_score = rec, score
-    return best
+        if bn == tn or bn in tn or tn in bn:
+            cands.append(rec)
+            if bn == tn:
+                exact_base.append(rec)
+    if not cands:
+        return None
+    if exact_base:
+        # "Naruto" must not swallow "Naruto Shippuden" seasons: when a
+        # hub title matches exactly, substring hubs lose.
+        cands = exact_base
+    if season is not None:
+        exact = [r for r in cands if any(k[0] == season for k in r["eps"])]
+        if exact:
+            d = [r for r in exact
+                 if "subbed" not in (r.get("site_name") or "").lower()]
+            return (d or exact)[0]
+        return None                    # never play another season's episodes
+    # no season requested: first season of the franchise (dub preferred)
+    def _s0(r):
+        ss = sorted(k[0] for k in r["eps"] if k[0])
+        return ss[0] if ss else 99
+    cands.sort(key=lambda r: (r["movie"], _s0(r)))
+    d = [r for r in cands
+         if "subbed" not in (r.get("site_name") or "").lower()]
+    return (d or cands)[0]
 
 
 def _rows_for(rec, s_filter, e_filter):
