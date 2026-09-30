@@ -51,7 +51,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -504,9 +504,23 @@ def _rewrite_m3u8(text, base_url, proxy_prefix):
     Handles absolute + relative URLs, variant lines, segment lines and
     URI="..." attributes (keys / maps / subtitles)."""
     out = []
+    br = None              # pending (start, end-inclusive) from BYTERANGE
+    last_end = 0
     for line in text.splitlines():
         ls = line.strip()
         if not ls:
+            continue
+        # Explode EXT-X-BYTERANGE into the segment URL (?rt=start-end):
+        # players that ignore the tag would otherwise download the WHOLE
+        # origin resource per segment ("full download" bug).  After this
+        # every segment is a standalone resource with an exact body.
+        if ls.startswith("#EXT-X-BYTERANGE"):
+            mb = re.match(r"#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?", ls)
+            if mb:
+                ln = int(mb.group(1))
+                st = int(mb.group(2)) if mb.group(2) is not None else last_end
+                br = (st, st + ln - 1)
+                last_end = st + ln
             continue
         if ls.startswith("#EXT-X-KEY") or ls.startswith("#EXT-X-MAP") \
                 or ls.startswith("#EXT-X-MEDIA") or ls.startswith("#EXT-X-I-FRAME"):
@@ -520,7 +534,11 @@ def _rewrite_m3u8(text, base_url, proxy_prefix):
         else:
             u = urljoin(base_url, ls)
             ext = ".m3u8" if u.lower().find(".m3u8") >= 0 else ".ts"
-            out.append(f"{proxy_prefix}/u/{_u64(u)}{ext}")
+            seg = f"{proxy_prefix}/u/{_u64(u)}{ext}"
+            if br:
+                seg += f"?rt={br[0]}-{br[1]}"
+                br = None
+            out.append(seg)
     return "\n".join(out) + "\n"
 
 
@@ -551,13 +569,19 @@ def _serve_m3u8_master(handler, zipper):
         handler._send({"error": f"master: {exc}"}, 502)
 
 
-def _serve_m3u8_child(handler, zipper, b64url, ext):
+def _serve_m3u8_child(handler, zipper, b64url, ext, rt=""):
     target = _u64d(b64url)
     if not target.startswith("http"):
         handler._send({"error": "bad child"}, 400)
         return
     proxy_prefix = f"/mq/{_mq_token(zipper)}"
     rng = handler.headers.get("Range")
+    forced = None
+    if rt:
+        mr = re.match(r"(\d+)-(\d+)", rt)
+        if mr:
+            forced = f"bytes={mr.group(1)}-{mr.group(2)}"
+            rng = forced          # the segment IS this byte slice
     try:
         # Variant/media playlists must be REWRITTEN too (their segment and
         # child-playlist URIs point at the CF-protected CDN); media files
@@ -636,6 +660,31 @@ def _serve_m3u8_child(handler, zipper, b64url, ext):
                             left -= len(ch)
                     return
         first = True
+        if forced:
+            # standalone exploded segment: plain 200 + exact Content-Length
+            handler.send_response(200)
+            handler.send_header("Content-Type", ctype)
+            if total:
+                handler.send_header("Content-Length", str(total))
+            handler.send_header("Accept-Ranges", "bytes")
+            handler.send_header("Access-Control-Allow-Origin", "*")
+            handler.send_header("Access-Control-Expose-Headers",
+                                "Content-Length, Accept-Ranges")
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            if not handler._is_head:
+                first = True
+                for ch in up.iter_content(256 * 1024):
+                    if not ch:
+                        continue
+                    if first:
+                        # html guard: origin handed a page, not media
+                        if ch.lstrip()[:4] in (b"<!DO", b"<htm"):
+                            return
+                        first = False
+                    handler.wfile.write(ch)
+            return
         _headers(total if total else None, cr)
         if not handler._is_head:
             for ch in up.iter_content(256 * 1024):
@@ -749,7 +798,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send({"error": "bad token"}, 400)
                     return
                 _serve_m3u8_child(self, zipper, m.group(2),
-                                  (m.group(3) or ".ts").lower())
+                                  (m.group(3) or ".ts").lower(),
+                                  rt=(qs.get("rt", [""])[0] if qs else ""))
                 return
             self._send({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
