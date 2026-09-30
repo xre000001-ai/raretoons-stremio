@@ -3288,6 +3288,10 @@ class Handler(BaseHTTPRequestHandler):
         if not host:
             return None
         h = host.split(":")[0].lower()
+        if "." not in h and h:
+            # beamup's router rewrites Host to the bare app name — rebuild the FQDN
+            h = h + ".baby-beamup.club"
+            host = h
         if (h in ("localhost", "0.0.0.0", "::1", "[::1]")
                 or h.startswith(("127.", "10.", "167.222.", "192.168."))
                 or re.match(r"^172\.(1[6-9]|2\d|3[01])\.", h)
@@ -3602,16 +3606,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/manifest.json":
-                try:
-                    dbg = {"host": self.headers.get("Host"), "xfh": self.headers.get("X-Forwarded-Host"),
-                           "xproto": self.headers.get("X-Forwarded-Proto"), "base": self._public_base()}
-                    self._last_dbg = dbg
-                except Exception:
-                    pass
-                mj = get_manifest(api_key=effective_key)
-                try: mj["x-hdrdbg"] = getattr(self, "_last_dbg", None)
-                except Exception: pass
-                self._send(mj)
+                self._send(get_manifest(api_key=effective_key))
                 return
 
             if path.startswith("/catalog/"):
