@@ -51,7 +51,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.4.0"
+VERSION = "2.6.0"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -88,6 +88,12 @@ def _display(show):
     s = re.split(r"\s+(?:[-–]\s+)?(?:Hindi|Tamil|Telugu|WatchMulti|Multi)\b",
                  show or "", maxsplit=1)[0].strip(" -–")
     s = re.sub(r"\s*(?:[-–]\s*)?Episodes?\.?\s*$", "", s, flags=re.I).strip(" -–")
+    # Subbed/Dubbed variants of the same show must NOT collapse into one
+    # name (Mushoku Tensei S3 exists on the site in BOTH flavours).
+    if re.search(r"subbed", show or "", re.I):
+        s += " (Hindi Sub)"
+    elif re.search(r"dubbed", show or "", re.I):
+        s += " (Hindi Dub)"
     return s or show
 
 
@@ -168,9 +174,43 @@ _BLOB_RE = re.compile(r'_juicycodes\(\s*((?:"[A-Za-z0-9+/=_-]{1,}"\s*\+\s*)+'
 _MASTER_RE = re.compile(r'"file":"(https:[^"]+\.m3u8)"')
 
 
+_WALL_RE = re.compile(r'data-href="([^"]+)"')
+
+
+def _zipper_walk(zipper, max_hops=4):
+    """codedew zipper links (all non-Hindi languages, and movies) sit
+    behind a 3-step "Security Scan" wall: each wall page carries a
+    goBtn data-href and the NEXT hop only resolves when the cookies
+    set on the first response are resent.  Walk the chain with a
+    cookie session; stop early once the argon embed iframe (watch /
+    multiquality page) is visible.  Returns (final_text, embed)."""
+    sess = creq.Session(impersonate="chrome")
+    prev = SEG_SITE
+    url = zipper
+    t = ""
+    for _ in range(max_hops + 1):
+        r = sess.get(url, headers={"User-Agent": UA, "Accept": "*/*",
+                                   "Accept-Language": "en-US,en;q=0.9",
+                                   "Referer": prev},
+                     timeout=RESOLVE_TIMEOUT, allow_redirects=True)
+        t = r.text or ""
+        m = _EMB_RE.search(t)
+        if m:
+            return t, m.group(1)
+        gh = _WALL_RE.search(t)
+        if not gh:
+            return t, None
+        prev = url
+        url = gh.group(1).replace("&amp;", "&")
+        if url.startswith("/"):
+            url = "https://codedew.com" + url
+    return t, None
+
+
 def _mq_resolve(zipper):
     """zipper -> (master_m3u8_url, embed_url) or (None, embed_url).
-    zipper page -> argon iframe -> embed page -> juicy blob -> config."""
+    zipper page (after the link-scan wall) -> argon iframe -> embed
+    page -> juicy blob -> config."""
     now = time.time()
     with _hls_lock:
         hit = _hls_cache.get(zipper)
@@ -179,10 +219,8 @@ def _mq_resolve(zipper):
     embed = None
     master = None
     try:
-        zp = cf_get(zipper, referer=SEG_SITE).text or ""
-        m = _EMB_RE.search(zp)
-        if m:
-            embed = m.group(1)
+        zp, embed = _zipper_walk(zipper)
+        if embed:
             ep = cf_get(embed, referer=zipper).text or ""
             b = _BLOB_RE.search(ep)
             if b:
@@ -191,6 +229,11 @@ def _mq_resolve(zipper):
                 mm = _MASTER_RE.search(dec)
                 if mm:
                     master = mm.group(1).replace("\\/", "/")
+        else:
+            # link-scan wall ended on a non-player page (hubcloud drive
+            # for multi-language episode files): embed stays None and
+            # the card falls back to the show hub on the site.
+            pass
     except Exception:
         pass
     ttl = HLS_TTL if master else NEG_TTL
@@ -239,7 +282,15 @@ def _mq_decode_token(tok):
 # ---------------------------------------------------------------- cards ----
 def _lang_label(raw):
     lang = re.sub(r"\s*(uncut|censored)\s*$", "", raw or "", flags=re.I).strip()
-    return lang or "Hindi"
+    if not lang or lang.lower() == "default":
+        return "Hindi"
+    if lang.lower() == "animetimes":
+        return "Anime Times"
+    if lang.lower() == "watchmultiquality":
+        # the site's generic MultiQuality button = the show's primary
+        # player (Hindi on these hubs)
+        return "Hindi"
+    return lang
 
 
 
@@ -292,6 +343,9 @@ def _match_show(title, season):
         if bn in tn or tn in bn:
             has = season is None or any(k[0] == season for k in rec["eps"])
             score = (2 if has else 0) + (3 if bn == tn else 0)
+            sn = (rec.get("site_name") or "").lower()
+            if "subbed" not in sn:          # prefer the Dubbed variant
+                score += 1
             if score > best_score:
                 best, best_score = rec, score
     return best
@@ -328,16 +382,12 @@ def handle_manifest():
         "logo": (base + "/logo.png") if base else "https://5a16d5684c14-raretoons.baby-beamup.club/logo.png",
         "background": None,
         "types": ["movie", "series"],
-        "resources": ["catalog", "meta", "stream"],
+        # streams-only: no catalogs of our own (user request) — streams
+        # resolve for foreign tt... ids from any catalog via Cinemeta,
+        # and for legacy raretoons2: ids.
+        "resources": ["stream", "meta"],
         "idPrefixes": ["raretoons2", "tt"],
-        "catalogs": [
-            {"type": "series", "id": "rt2_series", "name": "RareToons Series",
-             "extra": [{"name": "search", "isRequired": False},
-                       {"name": "skip", "isRequired": False}]},
-            {"type": "movie", "id": "rt2_movies", "name": "RareToons Movies",
-             "extra": [{"name": "search", "isRequired": False},
-                       {"name": "skip", "isRequired": False}]},
-        ],
+        "catalogs": [],
         "behaviorHints": {"configurable": False},
     }
 
@@ -435,23 +485,32 @@ def handle_stream(mtype, mid):
     ep_title = rows[0].get("ep_title") or rec["name"]
 
     picks = {}
+    order = {"Hindi": 0, "Hindi Uncut": 1, "Tamil": 2, "Telugu": 3,
+             "Bengali": 4, "Malayalam": 5, "Urdu": 6, "English": 7,
+             "Hindi Sub": 8}
     for r in rows:
         lang = _lang_label(r.get("lang"))
         z = r.get("mq") or r.get("sb")
         if z and lang not in picks:
             picks[lang] = z
+    picks = {k: picks[k] for k in sorted(picks, key=lambda k: order.get(k, 50))}
     if not picks:
         return {"streams": []}
     resolved = _mq_resolve_many(list(picks.values()))
 
+    dub_show = "dubbed" in (rec.get("site_name") or "").lower()
     streams, seen = [], set()
     for lang, z in picks.items():
         master, embed = resolved.get(z, (None, None))
+        note = ""
+        if dub_show and lang.lower() == "hindi sub":
+            note = " — site has no dub for this episode yet"
         if master:
             url = f"{base}/mq/{_mq_token(z)}.m3u8"
             streams.append({
                 "name": f"RT2 • {lang} • MQ",
-                "title": f"{prefix} • {ep_title} — MultiQuality (HLS, in-app)",
+                "title": (f"{prefix} • {ep_title} — MultiQuality (HLS, "
+                          f"in-app){note}"),
                 "description": (f"{prefix}\n◈ {lang}\n◈ MQ 1080p/720p/360p "
                                 "\n◈ plays inside the app"),
                 "url": url,
@@ -468,7 +527,8 @@ def handle_stream(mtype, mid):
             target = embed or rec.get("hub") or z
             streams.append({
                 "name": f"RT2 • {lang} • MQ",
-                "title": f"{prefix} • {ep_title} — MQ (opens website)",
+                "title": (f"{prefix} • {ep_title} — MQ (opens website)"
+                          f"{note}"),
                 "description": (f"{prefix}\n◈ {lang}\n◈ opens the show page "
                                 "on the site (pick the episode there)"),
                 "url": target,
