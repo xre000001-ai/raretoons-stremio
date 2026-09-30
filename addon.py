@@ -2182,7 +2182,13 @@ def resolve_one(row, public_base=None, deadline=None, budget=None):
             ext = source.get("ext") or _source_ext(source)
             server = _server_suffix(source, emit_idx, capped_total)
             quality = _quality_of(source)
-            url = _watch_url(public_base, zipper, orig_idx, ext) or raw
+            # In-app first (2026-09): stream THROUGH the addon (/proxy —
+            # same-origin, CORS + byte ranges). Direct 302s to the workers.dev
+            # CDNs fail on some ISPs/players; the proxied chain plays wherever
+            # the manifest loads. /watch stays as the non-public-base fallback.
+            url = (_proxy_url(public_base, zipper, orig_idx, ext)
+                   if public_base else None) \
+                or _watch_url(public_base, zipper, orig_idx, ext) or raw
             if not url or url in seen:
                 continue
             seen.add(url)
@@ -2190,19 +2196,23 @@ def resolve_one(row, public_base=None, deadline=None, budget=None):
             if first_emitted_source is None:
                 first_emitted_source = source
             label = " • ".join(x for x in (server, quality) if x)
+            proxied = bool(url) and "/proxy/" in url
             hints = {
-                # Signed CDN files are not CORS-enabled: Stremio's own
-                # player/server must fetch them, not the web page.
-                "notWebReady": True,
+                # /proxy serves the bytes from this addon itself: same-origin,
+                # CORS-open, correct Content-Type — the player can fetch it
+                # directly. Raw CDN cards (localhost dev) still need Stremio's
+                # own server to fetch them (no CORS on the signed CDNs).
+                "notWebReady": not proxied,
                 "bingeGroup": f"{binge_base}|{server or 'v1'}",
                 # Helps Stremio (desktop + Android) pick a demuxer and match
                 # external subtitles.
                 "filename": source.get("filename") or f"{prefix}.{(ext or '.mkv').lstrip('.')}",
-                "proxyHeaders": {"request": {"User-Agent": UA}},
             }
+            if not proxied:
+                hints["proxyHeaders"] = {"request": {"User-Agent": UA}}
             if source.get("size"):
                 hints["videoSize"] = source["size"]
-            desc = f"{title} — direct file" + (
+            desc = f"{title} — " + ("in-app (through addon)" if proxied else "direct file") + (
                 f" • {source['filename']}" if source.get("filename") else "")
             if lazy:
                 desc += " • resolved at playback"
@@ -3215,7 +3225,7 @@ def get_manifest(api_key=None):
     key_note = f" (TMDB key: {api_key[:6]}...)" if api_key and api_key != DEFAULT_TMDB_KEY else ""
     return {
         "id": "community.raretoons.stremio",
-        "version": "1.12.0",
+        "version": "1.13.0",
         "name": "RareToons (Hindi / Tamil / Telugu)",
         "description": ("Direct file streams (Server v1, v2, v3) from RareToonsIndia "
                         "(rareanimes.com). Links resolve, verify and fail over at "
@@ -3361,6 +3371,57 @@ class Handler(BaseHTTPRequestHandler):
             if code not in (200, 206, 416):
                 self._send({"error": f"upstream {code}"}, 502)
                 return
+            # Range normalizer: some worker origins ignore Range and answer
+            # 200 with the FULL body. Relay that as a proper 206 slice so
+            # player seeking always behaves.
+            if code == 200 and rng:
+                m2 = re.match(r"\s*bytes=(\d*)-(\d*)", rng)
+                total_s = upstream.headers.get("Content-Length") or ""
+                total = int(total_s) if total_s.isdigit() else 0
+                if m2 and (m2.group(1) or m2.group(2)) and total > 0:
+                    start = int(m2.group(1)) if m2.group(1) else 0
+                    end = int(m2.group(2)) if m2.group(2) else total - 1
+                    if start < total:
+                        end = min(end, total - 1)
+                        need = end - start + 1
+                        if need > 0:
+                            ctype = upstream.headers.get("Content-Type")
+                            if not ctype or "text" in ctype.lower() or "octet-stream" in ctype.lower():
+                                ctype = CONTENT_TYPES.get(ext.lower() or _url_ext(target),
+                                                          ctype or "video/mp4")
+                            self.send_response(206)
+                            self.send_header("Content-Type", ctype)
+                            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+                            self.send_header("Content-Length", str(need))
+                            self.send_header("Accept-Ranges", "bytes")
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            self.send_header("Access-Control-Expose-Headers",
+                                             "Content-Length, Content-Range, Accept-Ranges")
+                            self.send_header("Cache-Control", "no-store")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                            if not getattr(self, "_is_head", False):
+                                skip = start
+                                left = need
+                                for chunk in upstream.iter_content(chunk_size=256 * 1024):
+                                    if not chunk:
+                                        continue
+                                    if skip:
+                                        if len(chunk) <= skip:
+                                            skip -= len(chunk)
+                                            continue
+                                        chunk = chunk[skip:]
+                                        skip = 0
+                                    if left <= 0:
+                                        break
+                                    if len(chunk) > left:
+                                        chunk = chunk[:left]
+                                    self.wfile.write(chunk)
+                                    left -= len(chunk)
+                                    if left <= 0:
+                                        break
+                            self.log_message("range-normalized %s (%d-%d)", target[:60], start, end)
+                            return
             self.send_response(code)
             ctype = upstream.headers.get("Content-Type")
             if not ctype or "text" in ctype.lower() or "octet-stream" in ctype.lower():
@@ -3592,7 +3653,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = path.rstrip("/") or "/"
             if path in ("", "/"):
-                self._send({"addon": "RareToons", "version": "1.12.0",
+                self._send({"addon": "RareToons", "version": "1.13.0",
                             "manifest": "/manifest.json",
                             "shows_indexed": len(SHOWS),
                             "stream_config": {
@@ -3600,7 +3661,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "multiquality": "browser player (in-app HLS off: CDN is IP-locked, proxy would cost bandwidth)"
                                                 if not MQ_INAPP_HLS else "hls (in-app, proxied)",
                                 "webcast": "enabled" if EXPOSE_PROXY_STREAMS else "disabled",
-                                "video_bytes_through_addon": "zero (cards 302 to the CDN)",
+                                "video_bytes_through_addon": "in-app proxy (/proxy — plays everywhere)",
                             },
                             "endpoints": {
                                 "watch": "/watch/{token}[.ext] -> 302 to a live server (failover)",
