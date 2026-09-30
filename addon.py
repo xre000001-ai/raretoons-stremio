@@ -63,7 +63,7 @@ HLS_TTL = _env_int("HLS_TTL", 1800)               # zipper -> master URL
 NEG_TTL = _env_int("NEG_TTL", 60)                 # failed resolve cache
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-VERSION = "2.9.1"
+VERSION = "2.9.2"
 ADDON_ID = "community.raretoons2"
 BASE = os.path.dirname(os.path.abspath(__file__))
 SEG_SITE = "https://www.rareanimes.mov/"
@@ -345,6 +345,10 @@ def _lang_label(raw):
         # the site's generic MultiQuality button = the show's primary
         # player (Hindi on these hubs)
         return "Hindi"
+    if re.search(r"\s+dub$", lang, flags=re.I):
+        # "Hindi Dub" rows are the plain-dub card; "Hindi Sub" keeps
+        # its own " · sub" badge
+        return re.sub(r"\s+dub$", "", lang, flags=re.I)
     return lang
 
 
@@ -665,11 +669,14 @@ def handle_stream(mtype, mid):
         return {"streams": []}
     if not rec:
         return {"streams": []}
-    rows = _rows_for(rec, s_filter, e_filter)
-    if not rows:
-        # maybe a brand-new episode the static index never saw
+    # always merge the live hub (TTL-cached): the site adds Hindi-dub
+    # rows and new episodes continuously - the crawler snapshot goes
+    # stale within hours (e.g. Mushoku S3 E2+ dubs appeared later).
+    try:
         _absorb_live(rec, _live_rows(rec), s_filter)
-        rows = _rows_for(rec, s_filter, e_filter)
+    except Exception:
+        pass
+    rows = _rows_for(rec, s_filter, e_filter)
     if not rows:
         return {"streams": []}
     base = _public_base_holder.get("base") or ""
@@ -726,8 +733,11 @@ def handle_stream(mtype, mid):
         # resolved to our in-app HLS gets NO card at all.
         if not master:
             continue
-        note = ("site has no dub for this episode yet"
-                if dub_show and lang.lower() == "hindi sub" else "")
+        note = ""
+        if dub_show and lang.lower() == "hindi sub":
+            has_dub = any(_lang_label(l).lower() == "hindi" for l in resolved)
+            if not has_dub:
+                note = "site has no dub for this episode yet"
         streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base))
     return {"streams": streams}
 
