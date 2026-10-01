@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.5"
+VERSION  = "3.3.6"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -644,7 +644,7 @@ _cine_cache = {}
 _cine_lock = threading.Lock()
 
 
-def _cinemeta_name(mtype, ext_id):
+def _cinemeta_name_once(mtype, ext_id):
     now = time.time()
     key = (mtype, ext_id)
     with _cine_lock:
@@ -662,6 +662,17 @@ def _cinemeta_name(mtype, ext_id):
         name = None
     with _cine_lock:
         _cine_cache[key] = (now + (CINE_TTL if name else 90), name)
+    return name
+
+
+def _cinemeta_name(mtype, ext_id):
+    """Cinemeta occasionally returns an empty/stub body (transient) -
+    one immediate retry before giving up, so a search-tap never loses
+    its cards to a hiccup."""
+    name = _cinemeta_name_once(mtype, ext_id)
+    if not name:
+        time.sleep(0.4)
+        name = _cinemeta_name_once(mtype, ext_id)
     return name
 
 
