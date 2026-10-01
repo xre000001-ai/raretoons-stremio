@@ -72,7 +72,7 @@ LIVE_TTL        = _env_int("LIVE_TTL", 900)        # hub parse validity
 LIVE_NEG        = _env_int("LIVE_NEG", 240)        # empty hub parse cache
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.2.0"
+VERSION  = "3.2.1"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -302,6 +302,27 @@ _PSRCS_RE = re.compile(r"(?:var|const|let)\s+playerSources\s*=\s*"
 _wn_cache = {}                            # zipper -> (expires, direct_url)
 
 
+def _wn_inner(u):
+    """worker-lingering.../<b64> wraps {"url": <signed storage URL>} -
+    unwrap so the player gets the storage URL itself.  The /wn proxy
+    pipe starves on Untouched bitrates (12-40 Mbps -> MB burn, no
+    playback, frozen seeks); the storage endpoint serves byte-ranges at
+    full speed with no special headers (UA alone suffices, proven), so
+    the client downloads and seeks DIRECTLY - that is how other addons
+    play WatchNow."""
+    try:
+        if "workers.dev/" in u:
+            b64 = u.split("workers.dev/", 1)[1].split("?")[0].strip("/")
+            j = json.loads(base64.urlsafe_b64decode(
+                b64 + "=" * (-len(b64) % 4)))
+            inner = j.get("url") or ""
+            if inner.startswith("https://"):
+                return inner
+    except Exception:
+        pass
+    return u
+
+
 def _wn_resolve(zipper):
     """WatchNow page -> best direct file URL (Range-capable), or None."""
     now = time.time()
@@ -319,12 +340,12 @@ def _wn_resolve(zipper):
             for want in ("fsl", "10gbps"):       # R2 first: resume works
                 for s in srcs:
                     if s.get("type") == want and s.get("url", "").startswith("http"):
-                        url = s["url"]
+                        url = _wn_inner(s["url"])
                         break
                 if url:
                     break
             if not url and srcs and srcs[0].get("url", "").startswith("http"):
-                url = srcs[0]["url"]
+                url = _wn_inner(srcs[0]["url"])
     except Exception:
         url = None
     with _hls_lock:
@@ -661,9 +682,11 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ"):
         et = ep_title if ep_title and ep_title != rec["name"] else ""
         line2 = f"⬡ {prefix}" + (f" · {_clip(et, 34)}" if et else "")
     if src == "WN":
+        # direct signed storage URL - the player downloads and seeks
+        # straight from the origin (full speed, byte-range); no proxy
         line3 = "⊞ RareToons ◧ WN · Untouched MKV"
         name, binge, fname = "◫ WN ◫", f"rt2|wn|{lang.lower()}", f"{prefix}.mkv"
-        url = f"{base}/wn/{_mq_token(zipper)}"
+        url = zipper
     else:
         line3 = "⊞ RareToons ◧ MQ 1080·720·360"
         name, binge, fname = "◫ MQ ◫", f"rt2|mq|{lang.lower()}", f"{prefix}.m3u8"
