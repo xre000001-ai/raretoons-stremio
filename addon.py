@@ -72,7 +72,7 @@ LIVE_TTL        = _env_int("LIVE_TTL", 900)        # hub parse validity
 LIVE_NEG        = _env_int("LIVE_NEG", 240)        # empty hub parse cache
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.0.0"
+VERSION  = "3.0.1"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -821,8 +821,18 @@ def _serve_m3u8_master(handler, zipper):
         handler._send({"error": "MQ stream unavailable - try again"}, 502)
         return
     try:
-        r = upstream_get(master, referer=ARGON)
-        if r.status_code != 200:
+        # the site's video host (groovy) sometimes hangs at connect
+        # level during load spikes - one bounded retry rides out blips
+        r = None
+        for attempt in (1, 2):
+            try:
+                r = upstream_get(master, referer=ARGON,
+                                 timeout=RESOLVE_TIMEOUT)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+        if r is None or r.status_code != 200:
             # signed URL may have expired - refresh the resolve once
             with _hls_lock:
                 _hls_cache.pop(zipper, None)
