@@ -74,7 +74,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.0"
+VERSION  = "3.3.2"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -373,54 +373,61 @@ def _wn_inner(u):
 
 
 def _wn_resolve(zipper, stale_ok=False):
-    """WatchNow page -> best direct file URL (Range-capable), or None.
-    Same stale-while-revalidate contract as _mq_resolve; the stale
-    window is capped at 6h because the signed link itself expires 8h
-    after signing."""
+    """WatchNow page -> (direct_url, kind) or (None, None).  kind:
+    "fsl" = R2 signed storage (honours byte-ranges -> hand DIRECT to
+    the player); "10g" = googleusercontent (IGNORES Range - serves the
+    whole 0.8-17GB file with 200 -> must go through our /wn proxy so
+    the client still gets 206 slices).  Same stale-while-revalidate
+    contract as _mq_resolve; stale capped at WN_STALE (signed links
+    expire ~8h)."""
     now = time.time()
     with _hls_lock:
         hit = _wn_cache.get(zipper)
     if hit:
-        exp, url = hit
+        exp, url, kind = hit
         if url and (exp > now or (stale_ok and now - exp < WN_STALE)):
             if exp <= now:                       # stale serve -> refresh
                 _bg_once(("wn", zipper),
                          lambda: _wn_resolve(zipper))
-            return url
+            return url, kind
         if not url and exp > now:
-            return None                          # inside negative window
-    url = None
+            return None, None                    # inside negative window
+    url = kind = None
     try:
         text, _ = _zipper_walk(zipper,
                                deadline=time.monotonic() + WALK_BUDGET)
         mm = _PSRCS_RE.search(text or "")
         if mm:
             srcs = json.loads(mm.group(1).replace("\\/", "/"))
-            for want in ("fsl", "10gbps"):       # R2 first: resume works
+            for want, k2 in (("fsl", "fsl"), ("10gbps", "10g")):
                 for s in srcs:
-                    if s.get("type") == want and s.get("url", "").startswith("http"):
-                        url = _wn_inner(s["url"])
+                    if (s.get("type") == want
+                            and s.get("url", "").startswith("http")):
+                        url, kind = _wn_inner(s["url"]), k2
                         break
                 if url:
                     break
             if not url and srcs and srcs[0].get("url", "").startswith("http"):
                 url = _wn_inner(srcs[0]["url"])
+                kind = "fsl" if "cloudflarestorage" in url else "10g"
     except Exception:
-        url = None
+        url = kind = None
     if url:
         with _hls_lock:
-            _wn_cache[zipper] = (now + WN_TTL, url)
-        return url
+            _wn_cache[zipper] = (now + WN_TTL, url, kind)
+        return url, kind
     if hit and hit[1] and now - hit[0] < WN_STALE:   # keep the card alive
         _bg_once(("wn", zipper), lambda: _wn_resolve(zipper))
-        return hit[1]
+        return hit[1], hit[2]
     with _hls_lock:
-        _wn_cache[zipper] = (now + NEG_TTL, None)
-    return None
+        _wn_cache[zipper] = (now + NEG_TTL, None, None)
+    return None, None
 
 
 def _resolve_wn(cands, budget=LIST_BUDGET):
-    """{lang: [watchnow-zippers]} -> {lang: direct_url}, parallel."""
+    """{lang: [watchnow-zippers]} -> {lang: (direct_url, kind)},
+    parallel.  A language's range-capable (fsl) page always wins; the
+    range-hostile googleusercontent (10g) page is only a fallback."""
     out = {}
     if not cands:
         return out
@@ -428,14 +435,22 @@ def _resolve_wn(cands, budget=LIST_BUDGET):
     lock = threading.Lock()
 
     def _run(lang, zippers):
-        for z in zippers[:2]:
+        fb = None
+        for z in zippers[:3]:
             if time.monotonic() > deadline:
                 return
-            u = _wn_resolve(z, stale_ok=True)
-            if u:
+            u, kind = _wn_resolve(z, stale_ok=True)
+            if not u:
+                continue
+            if kind == "fsl":
                 with lock:
-                    out[lang] = u
+                    out[lang] = (u, kind)
                 return
+            if fb is None:
+                fb = (u, kind)     # 10g: keep looking for an fsl page
+        if fb:
+            with lock:
+                out[lang] = fb
 
     threads = [threading.Thread(target=_run, args=(l, zs), daemon=True)
                for l, zs in cands.items()]
@@ -489,16 +504,25 @@ def _live_rows(rec):
             # language = the nearest preceding <h4> heading ("Hindi -
             # Download" style sections).  A fixed look-back window fails:
             # WatchNow sits 3+ buttons deep and markup pushes the
-            # heading out of reach.
+            # heading out of reach.  QUALITY headings ("(Untouched)
+            # 4.63 GB", "4k (Untouched) 17 GB") are the SAME movie's
+            # size variants -> they INHERIT the running language; any
+            # other non-language h4 ("Watch Also", "Recommended", ...)
+            # RESETS it so foreign buttons are never mis-assigned.
+            _quality_head = re.compile(
+                r"(?i)\b(?:4k|\d+(?:\.\d+)?\s*(?:gb|mb)|untouched|"
+                r"1080p?|720p?|480p?|blu[- ]?ray|web[- ]?dl|hd)\b")
             heads = []
+            cur = None
             for hm in re.finditer(r"<h4[^>]*>(.*?)</h4>", page, re.S):
                 htxt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", hm.group(1)))
                 lang = next((L for L in _LIVE_LANGS
                              if re.search(rf"\b{L}\b", htxt, re.I)), None)
-                # every h4 is a section break; non-language sections
-                # ("Watch Also", "Recommended", ...) RESET the language so
-                # foreign buttons below them are never mis-assigned
-                heads.append((hm.start(), lang))
+                if lang:
+                    cur = lang
+                elif not _quality_head.search(htxt):
+                    cur = None
+                heads.append((hm.start(), cur))
             heads.sort()
 
             def _lang_at(pos):
@@ -734,7 +758,8 @@ def _clip(text, limit):
     return cut[:sp] if sp > limit // 2 else cut
 
 
-def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ"):
+def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
+              kind="fsl"):
     """Phoenix-style stream card (MQ = in-app HLS, WN = direct MKV)."""
     sub = " · sub" if lang.lower().endswith("sub") else ""
     lang0 = re.sub(r"\s*sub\s*$", "", lang, flags=re.I).strip() or lang
@@ -748,11 +773,13 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ"):
         et = ep_title if ep_title and ep_title != rec["name"] else ""
         line2 = f"⬡ {prefix}" + (f" · {_clip(et, 34)}" if et else "")
     if src == "WN":
-        # direct signed storage URL - the player downloads and seeks
-        # straight from the origin (full speed, byte-range); no proxy
+        # fsl (R2, Range-capable): hand the signed storage URL straight
+        # to the player.  10g (googleusercontent, ignores Range): route
+        # through our /wn proxy so the client still gets 206 slices.
         line3 = "⊞ RareToons ◧ WN · Untouched MKV"
         name, binge, fname = "◫ WN ◫", f"rt2|wn|{lang.lower()}", f"{prefix}.mkv"
-        url = zipper
+        url = (zipper if kind == "fsl"
+               else f"{base}/wn/{_mq_token(zipper)}")
     else:
         line3 = "⊞ RareToons ◧ MQ 1080·720·360"
         name, binge, fname = "◫ MQ ◫", f"rt2|mq|{lang.lower()}", f"{prefix}.m3u8"
@@ -1003,13 +1030,14 @@ def handle_stream(mtype, mid):
             note = "site has no dub for this episode yet"
         streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base))
 
-    # WatchNow direct sources (movies): signed per-language file URLs
-    # the player hits directly (Range-capable, no proxy).
+    # WatchNow direct sources (movies): signed per-language file URLs.
+    # fsl -> direct; 10g -> same-origin /wn slice-proxy.
     for lang in picks:                     # keep card order stable
-        u = wn_resolved.get(lang)
-        if u:
+        hit = wn_resolved.get(lang)
+        if hit:
+            u, kind = hit
             streams.append(_phx_card(rec, lang, prefix, ep_title,
-                                     "", u, base, src="WN"))
+                                     "", u, base, src="WN", kind=kind))
     return {"streams": streams}
 
 # ---------------------------------------------------- /mq HLS rewriter -----
@@ -1133,7 +1161,8 @@ def _serve_m3u8_master(handler, zipper):
         handler._send({"error": f"master: {exc}"}, 502)
 
 
-def _serve_m3u8_child(handler, zipper, b64url, ext, rt=""):
+def _serve_m3u8_child(handler, zipper, b64url, ext, rt="",
+                      open_rng=False):
     target = _u64d(b64url)
     if not target.startswith("http"):
         handler._send({"error": "bad child"}, 400)
@@ -1157,7 +1186,12 @@ def _serve_m3u8_child(handler, zipper, b64url, ext, rt=""):
             handler._send_raw(body, CONTENT_TYPES[".m3u8"])
             return
 
-        up = upstream_stream(target, referer=ARGON, rng=rng, timeout=30)
+            up_rng = rng
+        if open_rng and rng:                 # /wn slice-proxy: origin may
+            m0 = re.match(r"\s*bytes=(\d+)-", rng)  # honour only START
+            if m0:
+                up_rng = f"bytes={m0.group(1)}-"
+        up = upstream_stream(target, referer=ARGON, rng=up_rng, timeout=30)
         code = up.status_code
         if code not in (200, 206, 416):
             handler._send({"error": f"child {code}"}, 502)
@@ -1187,8 +1221,12 @@ def _serve_m3u8_child(handler, zipper, b64url, ext, rt=""):
             handler.send_header("Connection", "close")
             handler.end_headers()
 
-        # normalizer: origin ignored Range (200 + full body) -> slice
-        if code == 200 and rng and total > 0:
+        # normalizer: the client's requested slice is ALWAYS what goes
+        # out, whatever the origin does:
+        #   200 + full body        (googleusercontent) -> skip=start
+        #   206 but open-ended     (google honours start, not end)
+        #   206 exact              (R2, groovy)         -> pass through
+        if rng and total > 0 and code in (200, 206):
             m2 = re.match(r"\s*bytes=(\d*)-(\d*)", rng)
             if m2 and (m2.group(1) or m2.group(2)):
                 start = int(m2.group(1)) if m2.group(1) else 0
@@ -1196,9 +1234,15 @@ def _serve_m3u8_child(handler, zipper, b64url, ext, rt=""):
                 if start < total:
                     end = min(end, total - 1)
                     need = end - start + 1
+                    cr_start = 0
+                    if code == 206 and crange:
+                        mc = re.match(r"\s*bytes\s+(\d+)-(\d+)/", crange)
+                        if mc:
+                            cr_start = int(mc.group(1))
+                    skip = max(0, start - cr_start)
                     _headers(need, f"bytes {start}-{end}/{total}")
                     if not handler._is_head:
-                        _pump(handler, up, length=need, skip=start)
+                        _pump(handler, up, length=need, skip=skip)
                     return
 
         if forced:
@@ -1228,6 +1272,81 @@ def _serve_m3u8_child(handler, zipper, b64url, ext, rt=""):
             handler._send({"error": f"child: {exc}"}, 502)
         except Exception:
             pass
+
+
+
+def _serve_wn_slice(handler, b64url):
+    """Dedicated WatchNow slice-proxy for range-hostile origins
+    (googleusercontent serves 200-full or 206-open-ended).  No size
+    probe (that once pulled the whole file into RAM): the upstream is
+    opened with a start-only range and the client ALWAYS gets a proper
+    206 with an exact Content-Range/Content-Length."""
+    target = _u64d(b64url)
+    if not target.startswith("https://"):
+        handler._send({"error": "bad direct"}, 400)
+        return
+    rng = handler.headers.get("Range") or ""
+    print(f"[wn-recv] Range={rng!r} all={{k: v for k, v in handler.headers.items() if 'range' in k.lower() or 'accept' in k.lower()}}", flush=True)
+    mr = re.match(r"\s*bytes=(\d+)-(\d*)", rng)
+    start = int(mr.group(1)) if mr else 0
+    client_end = mr.group(2) if mr else ""
+    try:
+        up = upstream_stream(target, referer=ARGON,
+                             rng=(f"bytes={start}-" if start else None),
+                             timeout=30)
+        code = up.status_code
+        if code not in (200, 206):
+            handler._send({"error": f"wn upstream {code}"}, 502)
+            return
+        cr = up.headers.get("Content-Range") or ""
+        mc = re.match(r"\s*bytes\s+(\d+)-(\d+)/(\d+)", cr)
+        cl_s = up.headers.get("Content-Length") or ""
+        slicing = (code == 206) or bool(client_end and cl_s.isdigit()
+                                        and int(cl_s))
+        handler.send_response(206 if slicing else 200)
+        handler.send_header("Content-Type", "video/x-matroska")
+        handler.send_header("Accept-Ranges", "bytes")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Access-Control-Expose-Headers",
+                            "Content-Length, Content-Range, Accept-Ranges")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Connection", "close")
+        if code == 206 and mc:
+            cr_start, cr_end, total = (int(mc.group(1)), int(mc.group(2)),
+                                       int(mc.group(3)))
+            out_start = max(start, cr_start)
+            out_end = (min(int(client_end), cr_end) if client_end
+                       else cr_end)
+            need = max(0, out_end - out_start + 1)
+            handler.send_header("Content-Range",
+                                f"bytes {out_start}-{out_end}/{total}")
+            handler.send_header("Content-Length", str(need))
+            handler.end_headers()
+            if not handler._is_head and need:
+                _pump(handler, up, length=need, skip=out_start - cr_start)
+            return
+        # origin ignored the range completely (200 + whole file)
+        total = int(cl_s) if cl_s.isdigit() else 0
+        if client_end and total:
+            end = min(int(client_end), total - 1)
+            need = max(0, end - start + 1)
+            handler.send_header("Content-Range",
+                                f"bytes {start}-{end}/{total}")
+            handler.send_header("Content-Length", str(need))
+            handler.end_headers()
+            if not handler._is_head and need:
+                _pump(handler, up, length=need, skip=start)
+            return
+        if total:
+            handler.send_header("Content-Length", cl_s)
+        handler.end_headers()
+        if not handler._is_head and start:
+            _pump(handler, up, skip=start)
+        elif not handler._is_head:
+            _pump(handler, up)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
 
 # ---------------------------------------------------------- http server ----
 class Handler(BaseHTTPRequestHandler):
@@ -1334,11 +1453,21 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(rf"^/wn/({_B64_RE}+)$", path)
             if m:
                 target = _u64d(m.group(1))
+                if "workers.dev/" in target:     # worker-wrapped (legacy)
+                    inner = _wn_inner(target)
+                    if not inner.startswith("https://"):
+                        self._send({"error": "bad direct"}, 400)
+                        return
+                    _serve_m3u8_child(self, "", _u64(inner), ".mkv")
+                    return
+                # bare form (10g slice-proxy): allow known file hosts
                 if not (target.startswith("https://")
-                        and "workers.dev/" in target):
+                        and ("googleusercontent.com" in target
+                             or "cloudflarestorage.com" in target)):
                     self._send({"error": "bad direct"}, 400)
                     return
-                _serve_m3u8_child(self, "", m.group(1), ".mkv")
+                self.close_connection = True
+                _serve_wn_slice(self, m.group(1))
                 return
 
             self._send({"error": "not found"}, 404)
@@ -1358,6 +1487,8 @@ def public_base_from(handler):
     proto = handler.headers.get("X-Forwarded-Proto") or "http"
     return f"{proto}://{host}"
 
+
+print("[rt2] BOOT v=" + VERSION + " open_rng=yes", flush=True)
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
