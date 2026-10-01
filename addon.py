@@ -1548,6 +1548,19 @@ class Handler(BaseHTTPRequestHandler):
                 _serve_wn_slice(self, m.group(1))
                 return
 
+            if path == "/hdrs" or path.startswith("/hdrs?"):
+                import json as _j
+                self._send({"method": self.command,
+                            "range": self.headers.get("Range"),
+                            "ua": (self.headers.get("User-Agent") or "")[:40],
+                            "via": self.headers.get("X-Forwarded-For"),
+                            "all": {k: v for k, v in self.headers.items()
+                                    if k.lower() in ("range", "user-agent",
+                                                     "accept-encoding",
+                                                     "x-forwarded-proto")}},
+                           200)
+                return
+
             self._send({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
