@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.8"
+VERSION  = "3.3.9"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -826,9 +826,11 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
         # Range headers (proven via the /hdrs echo), so a same-origin
         # proxy can never seek - while the player hitting R2/google
         # DIRECTLY gets real byte-range seeking (how the IC cards work).
-        line3 = "⊞ RareToons ◧ WN · Untouched MKV"
         name, binge, fname = "◫ WN ◫", f"rt2|wn|{lang.lower()}", f"{prefix}.mkv"
         url = zipper
+        line3 = ("⊞ RareToons ◧ WN · Untouched MKV"
+                 if kind == "fsl"
+                 else "⊞ RareToons ◧ WN · Untouched (progressive)")
     else:
         line3 = "⊞ RareToons ◧ MQ 1080·720·360"
         name, binge, fname = "◫ MQ ◫", f"rt2|mq|{lang.lower()}", f"{prefix}.m3u8"
@@ -1031,7 +1033,23 @@ def handle_stream(mtype, mid):
             picks = _picks(rows)
             wn_cands = _wn_pool(rows)
             resolved, wn_resolved = _pools(rows, picks, wn_cands)
-    elif len(resolved) < len(picks) or (wn_cands and not wn_resolved):
+    elif not resolved or (wn_cands and not wn_resolved):
+        # resolution came up EMPTY (a rotated zipper): the user must
+        # never see zero cards on the first tap -> ONE synchronous live
+        # refresh + retry before serving whatever we have.
+        with _live_lock:
+            _live_cache.pop(rec.get("hub"), None)
+        try:
+            live = _live_rows(rec)
+        except Exception:
+            live = []
+        if live:
+            _absorb_live(rec, live, season)
+            rows = _rows_for(rec, season, episode)
+            picks = _picks(rows)
+            wn_cands = _wn_pool(rows)
+            resolved, wn_resolved = _pools(rows, picks, wn_cands)
+    if len(resolved) < len(picks) or (wn_cands and not wn_resolved):
         # partial resolve (a language/zipper failed): SERVE what we have
         # now - the user waits no extra second - and finish the missing
         # pieces in the background so the next request is complete.
@@ -1589,12 +1607,6 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.close_connection = True
                 _serve_wn_slice(self, m.group(1))
-                return
-
-            if path == "/diag":
-                import shutil, sys as _s
-                self._send({"ffmpeg": shutil.which("ffmpeg"),
-                            "python": _s.version.split()[0]}, 200)
                 return
 
             self._send({"error": "not found"}, 404)
