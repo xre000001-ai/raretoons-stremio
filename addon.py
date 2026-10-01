@@ -72,7 +72,7 @@ LIVE_TTL        = _env_int("LIVE_TTL", 900)        # hub parse validity
 LIVE_NEG        = _env_int("LIVE_NEG", 240)        # empty hub parse cache
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.1.0"
+VERSION  = "3.2.0"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -289,6 +289,75 @@ def _mq_decode_token(token):
     except Exception:
         return ""
 
+
+# ------------------------------------------------- WatchNow direct source --
+# A codedew "WatchNow" button opens the site's own VidStack player page.
+# The page embeds  playerSources = [{url: <worker-wrapped signed file>,
+# name: V1|V2, type: fsl|10gbps}, ...]  - DIRECT download URLs (R2-S3
+# signed ~8h, googleusercontent) that answer Range with 206.  That is
+# how other addons play WatchNow server-side.  One WatchNow zipper per
+# language lives on the movie hub.
+_PSRCS_RE = re.compile(r"(?:var|const|let)\s+playerSources\s*=\s*"
+                       r"(\[.*?\]);\s*(?:\n|var|const|let|function)", re.S)
+_wn_cache = {}                            # zipper -> (expires, direct_url)
+
+
+def _wn_resolve(zipper):
+    """WatchNow page -> best direct file URL (Range-capable), or None."""
+    now = time.time()
+    with _hls_lock:
+        hit = _wn_cache.get(zipper)
+        if hit and hit[0] > now:
+            return hit[1]
+    url = None
+    try:
+        text, _ = _zipper_walk(zipper,
+                               deadline=time.monotonic() + WALK_BUDGET)
+        mm = _PSRCS_RE.search(text or "")
+        if mm:
+            srcs = json.loads(mm.group(1).replace("\\/", "/"))
+            for want in ("fsl", "10gbps"):       # R2 first: resume works
+                for s in srcs:
+                    if s.get("type") == want and s.get("url", "").startswith("http"):
+                        url = s["url"]
+                        break
+                if url:
+                    break
+            if not url and srcs and srcs[0].get("url", "").startswith("http"):
+                url = srcs[0]["url"]
+    except Exception:
+        url = None
+    with _hls_lock:
+        _wn_cache[zipper] = (now + (HLS_TTL if url else NEG_TTL), url)
+    return url
+
+
+def _resolve_wn(cands, budget=LIST_BUDGET):
+    """{lang: [watchnow-zippers]} -> {lang: direct_url}, parallel."""
+    out = {}
+    if not cands:
+        return out
+    deadline = time.monotonic() + budget
+    lock = threading.Lock()
+
+    def _run(lang, zippers):
+        for z in zippers[:2]:
+            if time.monotonic() > deadline:
+                return
+            u = _wn_resolve(z)
+            if u:
+                with lock:
+                    out[lang] = u
+                return
+
+    threads = [threading.Thread(target=_run, args=(l, zs), daemon=True)
+               for l, zs in cands.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.1, deadline - time.monotonic()) + 0.5)
+    return out
+
 # --------------------------------------------------------- live freshness --
 _EP_POS_RE = re.compile(r"Episode\s*0*(\d{1,3})", re.I)
 _LANG_ZIP_RE = re.compile(
@@ -330,30 +399,50 @@ def _live_rows(rec):
         page = upstream_get(hub, referer=SITE).text or ""
         if rec.get("movie"):
             # every zipper with its button label, in document order;
-            # language inferred from the nearest preceding context
+            # language = the nearest preceding <h4> heading ("Hindi -
+            # Download" style sections).  A fixed look-back window fails:
+            # WatchNow sits 3+ buttons deep and markup pushes the
+            # heading out of reach.
+            heads = []
+            for hm in re.finditer(r"<h4[^>]*>(.*?)</h4>", page, re.S):
+                htxt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", hm.group(1)))
+                lang = next((L for L in _LIVE_LANGS
+                             if re.search(rf"\b{L}\b", htxt, re.I)), None)
+                # every h4 is a section break; non-language sections
+                # ("Watch Also", "Recommended", ...) RESET the language so
+                # foreign buttons below them are never mis-assigned
+                heads.append((hm.start(), lang))
+            heads.sort()
+
+            def _lang_at(pos):
+                lang = None
+                for hpos, hlang in heads:
+                    if hpos <= pos:
+                        lang = hlang
+                    else:
+                        break
+                return lang
+
             cands = []
             for mm in _ALL_BTN_RE.finditer(page):
                 label = mm.group(2).strip().lower()
                 if label not in _BTN_W:
                     continue          # HubCloud/DLBeta/Mega/MediaFire/...
-                ctx = re.sub(r"<[^>]+>", " ",
-                             page[max(0, mm.start() - 300):mm.start()])
-                ctx = re.sub(r"\s+", " ", ctx).strip()
-                lang = next((L for L in _LIVE_LANGS
-                             if re.search(rf"\b{L}\b", ctx, re.I)), None)
+                lang = _lang_at(mm.start())
                 if lang:
-                    cands.append((_BTN_W[label], lang, mm.group(1)))
+                    cands.append((_BTN_W[label], lang, mm.group(1), label))
             # dedupe per language, priority order, max 3 candidates
             best = {}
-            for w, lang, url in sorted(cands):
+            for w, lang, url, label in sorted(cands):
                 lst = best.setdefault(lang, [])
-                if url not in lst and len(lst) < 3:
-                    lst.append(url)
-            for lang, urls in best.items():
-                for u in urls:
+                if all(u != url for u, _ in lst) and len(lst) < 3:
+                    lst.append((url, label))
+            for lang, pairs in best.items():
+                for u, label in pairs:
                     rows.append({"show": rec["site_name"], "season": 0,
                                  "episode": 1, "ep_title": "", "lang": lang,
-                                 "hub_url": hub, "mq": u, "sb": ""})
+                                 "hub_url": hub, "mq": u, "sb": "",
+                                 "btn": label})
         else:
             eps = [(mm.start(), int(mm.group(1)))
                    for mm in _EP_POS_RE.finditer(page)]
@@ -480,12 +569,14 @@ def _base_title(rec):
     return re.sub(r"\s+", " ", n).strip(" -–")
 
 
-def _match_show(title, season):
+def _match_show(title, season, mtype="series"):
     """Franchise match: hubs whose base title matches the Cinemeta title;
     pick the hub carrying the REQUESTED season.  No such hub -> None
     (no cards beats wrong-season episodes).  Exact-base hubs beat
     substring hubs ("Naruto" must not swallow "Naruto Shippuden");
-    Subbed/Dubbed duplicates prefer Dubbed."""
+    Subbed/Dubbed duplicates prefer Dubbed.  mtype is authoritative for
+    franchise splits: a MOVIE id ("...Infinity Castle") must resolve to
+    the movie hub, never to the series hub (and vice versa)."""
     tn = _norm_title(title)
     if len(tn) < 4:
         return None
@@ -501,6 +592,12 @@ def _match_show(title, season):
         return None
     if exact_base:
         cands = exact_base
+    want_movie = mtype == "movie"
+    by_type = [r for r in cands if bool(r["movie"]) == want_movie]
+    if by_type:
+        cands = by_type                 # keep type-honest candidates only
+    elif any(bool(r["movie"]) != want_movie for r in cands):
+        return None                     # only wrong-type hubs -> no match
     if season is not None:
         with STORE_LOCK:
             exact = [r for r in cands if any(k[0] == season for k in r["eps"])]
@@ -550,14 +647,8 @@ def _clip(text, limit):
     return cut[:sp] if sp > limit // 2 else cut
 
 
-def _phx_card(rec, lang, prefix, ep_title, note, zipper, base):
-    """Phoenix-style stream card:
-
-        name   ◫ MQ ◫
-        title  ⧉ <title> ⌗ <Language>[ · sub]
-               ⬡ Movie | ⬡ S01E05 · <ep title>
-               ⊞ RareToons ◧ MQ 1080·720·360[ · note]
-    """
+def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ"):
+    """Phoenix-style stream card (MQ = in-app HLS, WN = direct MKV)."""
     sub = " · sub" if lang.lower().endswith("sub") else ""
     lang0 = re.sub(r"\s*sub\s*$", "", lang, flags=re.I).strip() or lang
     # hub names carry "(Hindi Dubbed) ..." tails; the badge already says it
@@ -569,17 +660,24 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base):
     else:
         et = ep_title if ep_title and ep_title != rec["name"] else ""
         line2 = f"⬡ {prefix}" + (f" · {_clip(et, 34)}" if et else "")
-    line3 = "⊞ RareToons ◧ MQ 1080·720·360"
+    if src == "WN":
+        line3 = "⊞ RareToons ◧ WN · Untouched MKV"
+        name, binge, fname = "◫ WN ◫", f"rt2|wn|{lang.lower()}", f"{prefix}.mkv"
+        url = f"{base}/wn/{_mq_token(zipper)}"
+    else:
+        line3 = "⊞ RareToons ◧ MQ 1080·720·360"
+        name, binge, fname = "◫ MQ ◫", f"rt2|mq|{lang.lower()}", f"{prefix}.m3u8"
+        url = f"{base}/mq/{_mq_token(zipper)}.m3u8"
     if note:
         line3 += f" · {note}"
     return {
-        "name": "◫ MQ ◫",
+        "name": name,
         "title": f"{line1}\n{line2}\n{line3}",
-        "url": f"{base}/mq/{_mq_token(zipper)}.m3u8",
+        "url": url,
         "behaviorHints": {
             "notWebReady": False,
-            "bingeGroup": f"rt2|mq|{lang.lower()}",
-            "filename": f"{prefix}.m3u8",
+            "bingeGroup": binge,
+            "filename": fname,
         },
     }
 
@@ -681,7 +779,7 @@ def handle_stream(mtype, mid):
         except ValueError:
             pass
         title = _cinemeta_name(mtype, parts[0])
-        rec = _match_show(title, season) if title else None
+        rec = _match_show(title, season, mtype) if title else None
     else:
         return {"streams": []}
     if not rec:
@@ -747,6 +845,28 @@ def handle_stream(mtype, mid):
         if dub_show and lang.lower() == "hindi sub" and not has_dub:
             note = "site has no dub for this episode yet"
         streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base))
+
+    # WatchNow direct sources (movies): the VidStack player pages embed
+    # signed direct file URLs (Range-capable) - one WatchNow zipper per
+    # language lives on the hub.  Offer them as an extra card per
+    # language after the MQ cards.
+    if rec["movie"]:
+        wn_cands = {}
+        for r in rows:
+            if r.get("btn") != "watchnow":
+                continue
+            lang = _lang_label(r.get("lang"))
+            z = r.get("mq")
+            if z:
+                lst = wn_cands.setdefault(lang, [])
+                if z not in lst:
+                    lst.append(z)
+        wn_resolved = _resolve_wn(wn_cands)
+        for lang in picks:                 # keep card order stable
+            u = wn_resolved.get(lang)
+            if u:
+                streams.append(_phx_card(rec, lang, prefix, ep_title,
+                                         "", u, base, src="WN"))
     return {"streams": streams}
 
 # ---------------------------------------------------- /mq HLS rewriter -----
@@ -1066,6 +1186,16 @@ class Handler(BaseHTTPRequestHandler):
                 _serve_m3u8_child(self, zipper, m.group(2),
                                   (m.group(3) or ".ts").lower(),
                                   rt=(qs.get("rt", [""])[0] if qs else ""))
+                return
+
+            m = re.match(rf"^/wn/({_B64_RE}+)$", path)
+            if m:
+                target = _u64d(m.group(1))
+                if not (target.startswith("https://")
+                        and "workers.dev/" in target):
+                    self._send({"error": "bad direct"}, 400)
+                    return
+                _serve_m3u8_child(self, "", m.group(1), ".mkv")
                 return
 
             self._send({"error": "not found"}, 404)
