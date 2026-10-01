@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.6"
+VERSION  = "3.3.8"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -432,8 +432,8 @@ def _wn_resolve(zipper, stale_ok=False):
 
 def _resolve_wn(cands, budget=LIST_BUDGET):
     """{lang: [watchnow-zippers]} -> {lang: (direct_url, kind, zipper)},
-    parallel.  ONLY range-capable (fsl/R2) pages qualify - google-
-    hosted WatchNow files cannot stream-seek, so no card for them."""
+    parallel.  R2 (fsl) pages win; google (10g) is the fallback so WN
+    shows for series and movies in every language the site carries."""
     out = {}
     if not cands:
         return out
@@ -441,19 +441,25 @@ def _resolve_wn(cands, budget=LIST_BUDGET):
     lock = threading.Lock()
 
     def _run(lang, zippers):
-        # PLAYABLE-ONLY: a WatchNow card is emitted only for range-
-        # capable R2 sources.  googleusercontent (10g) answers ranged
-        # GETs with 200+whole-file too often - those files cannot
-        # stream-seek in a player, so offering them just clutters the
-        # list with cards that stall (the MQ card covers that title).
+        # R2 (fsl) preferred - full range seeking; google (10g) fallback
+        # (plays fine, seeks best-effort) so every language that has a
+        # WatchNow button gets its card, series and movies alike.
+        fb = None
         for z in zippers[:3]:
             if time.monotonic() > deadline:
                 return
             u, kind = _wn_resolve(z, stale_ok=True)
-            if u and kind == "fsl":
+            if not u:
+                continue
+            if kind == "fsl":
                 with lock:
                     out[lang] = (u, kind, z)
                 return
+            if fb is None:
+                fb = (u, kind, z)
+        if fb:
+            with lock:
+                out[lang] = fb
 
     threads = [threading.Thread(target=_run, args=(l, zs), daemon=True)
                for l, zs in cands.items()]
@@ -572,6 +578,35 @@ def _live_rows(rec):
                                  "episode": ep, "ep_title": "",
                                  "lang": lm.group(1).strip(), "hub_url": hub,
                                  "mq": lm.group(2), "sb": ""})
+            # series WatchNow buttons (one per episode x language):
+            # episode = nearest preceding "Episode N" anchor, language =
+            # nearest preceding language span, else the hub slug language
+            _dl = next((w.title() for w in ("hindi", "tamil", "telugu",
+                                            "bengali", "english")
+                        if w in (rec.get("site_name") or "").lower()), "Hindi")
+            for mm in _ALL_BTN_RE.finditer(page):
+                if mm.group(2).strip().lower() != "watchnow":
+                    continue
+                ep = 0
+                for pos, n in eps:
+                    if pos < mm.start():
+                        ep = n
+                    else:
+                        break
+                if not ep:
+                    continue
+                lang = None
+                for lpos, l in [(x.start(), x.group(1).strip())
+                                for x in _LANG_ZIP_RE.finditer(page)]:
+                    if lpos < mm.start():
+                        lang = l
+                    else:
+                        break
+                rows.append({"show": rec["site_name"], "season": None,
+                             "episode": ep, "ep_title": "",
+                             "lang": lang or _dl, "hub_url": hub,
+                             "mq": mm.group(1), "sb": "",
+                             "btn": "watchnow"})
     except Exception:
         rows = []
     with _live_lock:
@@ -975,7 +1010,7 @@ def handle_stream(mtype, mid):
             t.join(max(0.5, dl - time.monotonic()))
         return box.get("mq") or {}, box.get("wn") or {}
 
-    wn_cands = _wn_pool(rows) if rec["movie"] else {}
+    wn_cands = _wn_pool(rows)
     resolved, wn_resolved = _pools(rows, picks, wn_cands)
 
     # requested episode absent from the merged view -> ONE synchronous
@@ -994,7 +1029,7 @@ def handle_stream(mtype, mid):
             _absorb_live(rec, live, season)
             rows = _rows_for(rec, season, episode)
             picks = _picks(rows)
-            wn_cands = _wn_pool(rows) if rec["movie"] else {}
+            wn_cands = _wn_pool(rows)
             resolved, wn_resolved = _pools(rows, picks, wn_cands)
     elif len(resolved) < len(picks) or (wn_cands and not wn_resolved):
         # partial resolve (a language/zipper failed): SERVE what we have
@@ -1010,7 +1045,7 @@ def handle_stream(mtype, mid):
             fp = _picks(fr)
             if fp:
                 _resolve_picks(fp)
-            wc = _wn_pool(fr) if rec["movie"] else {}
+            wc = _wn_pool(fr)
             if wc:
                 _resolve_wn(wc)
         _bg_once(("fin", rec.get("hub"), season, episode), _fin)
@@ -1200,7 +1235,7 @@ def _serve_m3u8_child(handler, zipper, b64url, ext, rt="",
             handler._send_raw(body, CONTENT_TYPES[".m3u8"])
             return
 
-            up_rng = rng
+        up_rng = rng
         if open_rng and rng:                 # /wn slice-proxy: origin may
             m0 = re.match(r"\s*bytes=(\d+)-", rng)  # honour only START
             if m0:
