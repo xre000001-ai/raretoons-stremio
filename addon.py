@@ -1591,6 +1591,12 @@ class Handler(BaseHTTPRequestHandler):
                 _serve_wn_slice(self, m.group(1))
                 return
 
+            if path == "/diag":
+                import shutil, sys as _s
+                self._send({"ffmpeg": shutil.which("ffmpeg"),
+                            "python": _s.version.split()[0]}, 200)
+                return
+
             self._send({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
