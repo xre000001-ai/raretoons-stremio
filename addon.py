@@ -48,6 +48,8 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
 
 import requests
@@ -74,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.2"
+VERSION  = "3.3.3"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -413,8 +415,12 @@ def _wn_resolve(zipper, stale_ok=False):
     except Exception:
         url = kind = None
     if url:
+        # googleusercontent (10g) links carry no signature/expiry params
+        # and die unpredictably -> short fresh window so PLAY time
+        # (always fresh-resolved through /wn) never gets a dead one
         with _hls_lock:
-            _wn_cache[zipper] = (now + WN_TTL, url, kind)
+            _wn_cache[zipper] = (now + (WN_TTL if kind == "fsl" else 300),
+                                 url, kind)
         return url, kind
     if hit and hit[1] and now - hit[0] < WN_STALE:   # keep the card alive
         _bg_once(("wn", zipper), lambda: _wn_resolve(zipper))
@@ -444,10 +450,10 @@ def _resolve_wn(cands, budget=LIST_BUDGET):
                 continue
             if kind == "fsl":
                 with lock:
-                    out[lang] = (u, kind)
+                    out[lang] = (u, kind, z)
                 return
             if fb is None:
-                fb = (u, kind)     # 10g: keep looking for an fsl page
+                fb = (u, kind, z)  # 10g: keep looking for an fsl page
         if fb:
             with lock:
                 out[lang] = fb
@@ -1035,9 +1041,9 @@ def handle_stream(mtype, mid):
     for lang in picks:                     # keep card order stable
         hit = wn_resolved.get(lang)
         if hit:
-            u, kind = hit
+            u, kind, z = hit
             streams.append(_phx_card(rec, lang, prefix, ep_title,
-                                     "", u, base, src="WN", kind=kind))
+                                     "", z, base, src="WN", kind=kind))
     return {"streams": streams}
 
 # ---------------------------------------------------- /mq HLS rewriter -----
@@ -1275,77 +1281,135 @@ def _serve_m3u8_child(handler, zipper, b64url, ext, rt="",
 
 
 
+_wn_size_cache = {}                        # target -> (expires, size)
+
+
+def _wn_plain(url, rng, timeout):
+    """Plain urllib streaming client for WatchNow file hosts (google-
+    sensible: no browser impersonation needed there, and urllib's
+    read(n)/close() never buffers the whole body).  Returns
+    (status, resp) or (error_status, None)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA, "Accept": "*/*", **({"Range": rng} if rng else {})})
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        return resp.status, resp
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return 0, None
+
+
+def _wn_pump(handler, resp, need, skip):
+    """Chunked copy for urllib responses: drop `skip` bytes, send exactly
+    `need` bytes, abort on dead/stalled clients (30s write timeout)."""
+    handler.connection.settimeout(30)
+    written = skipped = 0
+    while written < need:
+        chunk = resp.read(min(262144, need - written + skipped))
+        if not chunk:
+            break
+        if skipped < skip:
+            take = min(skip - skipped, len(chunk))
+            skipped += take
+            chunk = chunk[take:]
+            if not chunk:
+                continue
+        handler.wfile.write(chunk)
+        written += len(chunk)
+    return written
+
+
+
+
+
+def _wn_size(target):
+    """File size via a headers-only ranged probe.  stream=True + close()
+    so the body is never downloaded (a plain upstream_get here once
+    pulled 796 MB into RAM and OOM-killed the box)."""
+    now = time.time()
+    with _hls_lock:
+        hit = _wn_size_cache.get(target)
+    if hit and hit[0] > now:
+        return hit[1]
+    total = 0
+    code, r = _wn_plain(target, "bytes=0-0", 15)
+    if r is not None:
+        try:
+            mc = re.match(r"\s*bytes\s+\d+-\d+/(\d+)",
+                          r.headers.get("Content-Range") or "")
+            if mc:
+                total = int(mc.group(1))
+            else:
+                cl = r.headers.get("Content-Length") or ""
+                total = int(cl) if cl.isdigit() else 0
+        finally:
+            r.close()
+    else:
+        total = 0
+    with _hls_lock:
+        _wn_size_cache[target] = (now + 3600, total)
+    return total
+
+
 def _serve_wn_slice(handler, b64url):
-    """Dedicated WatchNow slice-proxy for range-hostile origins
-    (googleusercontent serves 200-full or 206-open-ended).  No size
-    probe (that once pulled the whole file into RAM): the upstream is
-    opened with a start-only range and the client ALWAYS gets a proper
-    206 with an exact Content-Range/Content-Length."""
+    """WatchNow slice-proxy.  googleusercontent answers ranged GETs
+    INCONSISTENTLY (open-ended 206 sometimes, 200 + whole file other
+    times) - so upstream status/CL are never trusted for the outgoing
+    headers.  We probe the size ourselves (cached), always answer a
+    proper 206 with an exact Content-Range + matching Content-Length,
+    then pump exactly that many bytes, skipping whatever junk offset
+    the origin decided to send.  A player cannot stall on this."""
     target = _u64d(b64url)
     if not target.startswith("https://"):
         handler._send({"error": "bad direct"}, 400)
         return
+    total = _wn_size(target)
+    if not total:
+        handler._send({"error": "size unknown"}, 502)
+        return
     rng = handler.headers.get("Range") or ""
-    print(f"[wn-recv] Range={rng!r} all={{k: v for k, v in handler.headers.items() if 'range' in k.lower() or 'accept' in k.lower()}}", flush=True)
     mr = re.match(r"\s*bytes=(\d+)-(\d*)", rng)
     start = int(mr.group(1)) if mr else 0
     client_end = mr.group(2) if mr else ""
-    try:
-        up = upstream_stream(target, referer=ARGON,
-                             rng=(f"bytes={start}-" if start else None),
-                             timeout=30)
-        code = up.status_code
-        if code not in (200, 206):
-            handler._send({"error": f"wn upstream {code}"}, 502)
-            return
-        cr = up.headers.get("Content-Range") or ""
-        mc = re.match(r"\s*bytes\s+(\d+)-(\d+)/(\d+)", cr)
-        cl_s = up.headers.get("Content-Length") or ""
-        slicing = (code == 206) or bool(client_end and cl_s.isdigit()
-                                        and int(cl_s))
-        handler.send_response(206 if slicing else 200)
-        handler.send_header("Content-Type", "video/x-matroska")
-        handler.send_header("Accept-Ranges", "bytes")
-        handler.send_header("Access-Control-Allow-Origin", "*")
-        handler.send_header("Access-Control-Expose-Headers",
-                            "Content-Length, Content-Range, Accept-Ranges")
-        handler.send_header("Cache-Control", "no-store")
-        handler.send_header("Connection", "close")
-        if code == 206 and mc:
-            cr_start, cr_end, total = (int(mc.group(1)), int(mc.group(2)),
-                                       int(mc.group(3)))
-            out_start = max(start, cr_start)
-            out_end = (min(int(client_end), cr_end) if client_end
-                       else cr_end)
-            need = max(0, out_end - out_start + 1)
-            handler.send_header("Content-Range",
-                                f"bytes {out_start}-{out_end}/{total}")
-            handler.send_header("Content-Length", str(need))
-            handler.end_headers()
-            if not handler._is_head and need:
-                _pump(handler, up, length=need, skip=out_start - cr_start)
-            return
-        # origin ignored the range completely (200 + whole file)
-        total = int(cl_s) if cl_s.isdigit() else 0
-        if client_end and total:
-            end = min(int(client_end), total - 1)
-            need = max(0, end - start + 1)
-            handler.send_header("Content-Range",
-                                f"bytes {start}-{end}/{total}")
-            handler.send_header("Content-Length", str(need))
-            handler.end_headers()
-            if not handler._is_head and need:
-                _pump(handler, up, length=need, skip=start)
-            return
-        if total:
-            handler.send_header("Content-Length", cl_s)
+    end = min(int(client_end), total - 1) if client_end else total - 1
+    if start >= total or start > end:
+        handler.send_response(416)
+        handler.send_header("Content-Range", f"bytes */{total}")
         handler.end_headers()
-        if not handler._is_head and start:
-            _pump(handler, up, skip=start)
-        elif not handler._is_head:
-            _pump(handler, up)
-    except (BrokenPipeError, ConnectionResetError):
+        return
+    need = end - start + 1
+    handler.send_response(206)
+    handler.send_header("Content-Type", "video/x-matroska")
+    handler.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+    handler.send_header("Content-Length", str(need))
+    handler.send_header("Accept-Ranges", "bytes")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Expose-Headers",
+                        "Content-Length, Content-Range, Accept-Ranges")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    if handler._is_head or need <= 0:
+        return
+    try:
+        code, up = _wn_plain(target,
+                             f"bytes={start}-" if start else None, 45)
+        if up is None:
+            return                          # headers sent; client retries
+        skip = start                        # 200 = whole file from 0
+        if code == 206:                     # honoured our start-only rng
+            mc = re.match(r"\s*bytes\s+(\d+)-",
+                          up.headers.get("Content-Range") or "")
+            skip = max(0, start - int(mc.group(1))) if mc else 0
+        _wn_pump(handler, up, need, skip)
+    except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
         pass
+    finally:
+        try:
+            up.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------- http server ----
@@ -1453,6 +1517,20 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(rf"^/wn/({_B64_RE}+)$", path)
             if m:
                 target = _u64d(m.group(1))
+                if target.startswith("https://codedew.com/"):
+                    # zipper payload: resolve FRESH at play time - the
+                    # card may be hours old, the file link is not
+                    u, _kind = _wn_resolve(target, stale_ok=False)
+                    if not u:
+                        with _hls_lock:
+                            _wn_cache.pop(target, None)
+                        u, _kind = _wn_resolve(target, stale_ok=False)
+                    if not u:
+                        self._send({"error": "wn resolve failed"}, 502)
+                        return
+                    self.close_connection = True
+                    _serve_wn_slice(self, _u64(u))
+                    return
                 if "workers.dev/" in target:     # worker-wrapped (legacy)
                     inner = _wn_inner(target)
                     if not inner.startswith("https://"):
@@ -1460,7 +1538,7 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     _serve_m3u8_child(self, "", _u64(inner), ".mkv")
                     return
-                # bare form (10g slice-proxy): allow known file hosts
+                # legacy bare-URL payload: known file hosts only
                 if not (target.startswith("https://")
                         and ("googleusercontent.com" in target
                              or "cloudflarestorage.com" in target)):
