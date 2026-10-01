@@ -72,7 +72,7 @@ LIVE_TTL        = _env_int("LIVE_TTL", 900)        # hub parse validity
 LIVE_NEG        = _env_int("LIVE_NEG", 240)        # empty hub parse cache
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.0.1"
+VERSION  = "3.1.0"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -298,6 +298,14 @@ _LANG_ZIP_RE = re.compile(
 _HUB_ZIP_RE = re.compile(r'href="(https://codedew\.com/zipper/\?url=[^"]+)"')
 _LIVE_LANGS = ("Hindi", "Tamil", "Telugu", "English", "Japanese",
                "Bengali", "Malayalam", "Urdu")
+# movie-hub source buttons (user request): ONLY WatchMultiQuality and
+# WatchNow are wanted; Download-labelled links stay as last-resort
+# because some real players (e.g. Shinchan Bengali) carry that label;
+# HubCloud/DLBeta/Mega/MediaFire/4k/GB rows are download-only: dropped.
+_BTN_W = {"watchmultiquality": 0, "watchnow": 1, "download": 2}
+_ALL_BTN_RE = re.compile(
+    r'href="(https://codedew\.com/zipper/\?url=[^"]+)"[^>]*>'
+    r"\s*([A-Za-z0-9 ]+?)\s*<", re.S)
 
 _live_cache = {}                          # hub -> (expires, rows)
 _live_lock = threading.Lock()
@@ -321,20 +329,31 @@ def _live_rows(rec):
     try:
         page = upstream_get(hub, referer=SITE).text or ""
         if rec.get("movie"):
-            for mm in _HUB_ZIP_RE.finditer(page):
+            # every zipper with its button label, in document order;
+            # language inferred from the nearest preceding context
+            cands = []
+            for mm in _ALL_BTN_RE.finditer(page):
+                label = mm.group(2).strip().lower()
+                if label not in _BTN_W:
+                    continue          # HubCloud/DLBeta/Mega/MediaFire/...
                 ctx = re.sub(r"<[^>]+>", " ",
                              page[max(0, mm.start() - 300):mm.start()])
                 ctx = re.sub(r"\s+", " ", ctx).strip()
-                if not any(b in ctx for b in ("WatchMultiQuality", "WatchNow",
-                                              "Download")):
-                    continue
-                for lang in _LIVE_LANGS:
-                    if re.search(rf"\b{lang}\b", ctx, re.I):
-                        rows.append({"show": rec["site_name"], "season": 0,
-                                     "episode": 1, "ep_title": "",
-                                     "lang": lang, "hub_url": hub,
-                                     "mq": mm.group(1), "sb": ""})
-                        break
+                lang = next((L for L in _LIVE_LANGS
+                             if re.search(rf"\b{L}\b", ctx, re.I)), None)
+                if lang:
+                    cands.append((_BTN_W[label], lang, mm.group(1)))
+            # dedupe per language, priority order, max 3 candidates
+            best = {}
+            for w, lang, url in sorted(cands):
+                lst = best.setdefault(lang, [])
+                if url not in lst and len(lst) < 3:
+                    lst.append(url)
+            for lang, urls in best.items():
+                for u in urls:
+                    rows.append({"show": rec["site_name"], "season": 0,
+                                 "episode": 1, "ep_title": "", "lang": lang,
+                                 "hub_url": hub, "mq": u, "sb": ""})
         else:
             eps = [(mm.start(), int(mm.group(1)))
                    for mm in _EP_POS_RE.finditer(page)]
