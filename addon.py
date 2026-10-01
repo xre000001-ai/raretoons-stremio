@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.3"
+VERSION  = "3.3.4"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -779,13 +779,13 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
         et = ep_title if ep_title and ep_title != rec["name"] else ""
         line2 = f"⬡ {prefix}" + (f" · {_clip(et, 34)}" if et else "")
     if src == "WN":
-        # fsl (R2, Range-capable): hand the signed storage URL straight
-        # to the player.  10g (googleusercontent, ignores Range): route
-        # through our /wn proxy so the client still gets 206 slices.
+        # ALWAYS the direct origin link: the beamup edge strips client
+        # Range headers (proven via the /hdrs echo), so a same-origin
+        # proxy can never seek - while the player hitting R2/google
+        # DIRECTLY gets real byte-range seeking (how the IC cards work).
         line3 = "⊞ RareToons ◧ WN · Untouched MKV"
         name, binge, fname = "◫ WN ◫", f"rt2|wn|{lang.lower()}", f"{prefix}.mkv"
-        url = (zipper if kind == "fsl"
-               else f"{base}/wn/{_mq_token(zipper)}")
+        url = zipper
     else:
         line3 = "⊞ RareToons ◧ MQ 1080·720·360"
         name, binge, fname = "◫ MQ ◫", f"rt2|mq|{lang.lower()}", f"{prefix}.m3u8"
@@ -1043,7 +1043,7 @@ def handle_stream(mtype, mid):
         if hit:
             u, kind, z = hit
             streams.append(_phx_card(rec, lang, prefix, ep_title,
-                                     "", z, base, src="WN", kind=kind))
+                                     "", u, base, src="WN", kind=kind))
     return {"streams": streams}
 
 # ---------------------------------------------------- /mq HLS rewriter -----
@@ -1546,19 +1546,6 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.close_connection = True
                 _serve_wn_slice(self, m.group(1))
-                return
-
-            if path == "/hdrs" or path.startswith("/hdrs?"):
-                import json as _j
-                self._send({"method": self.command,
-                            "range": self.headers.get("Range"),
-                            "ua": (self.headers.get("User-Agent") or "")[:40],
-                            "via": self.headers.get("X-Forwarded-For"),
-                            "all": {k: v for k, v in self.headers.items()
-                                    if k.lower() in ("range", "user-agent",
-                                                     "accept-encoding",
-                                                     "x-forwarded-proto")}},
-                           200)
                 return
 
             self._send({"error": "not found"}, 404)
