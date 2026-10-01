@@ -69,10 +69,12 @@ LIST_BUDGET     = _env_int("LIST_BUDGET", 15)      # per /stream resolve, s
 HLS_TTL         = _env_int("HLS_TTL", 1800)        # zipper -> master URL
 NEG_TTL         = _env_int("NEG_TTL", 60)          # failed resolve cache
 LIVE_TTL        = _env_int("LIVE_TTL", 900)        # hub parse validity
-LIVE_NEG        = _env_int("LIVE_NEG", 240)        # empty hub parse cache
+LIVE_NEG        = _env_int("LIVE_NEG", 60)         # empty hub parse cache
+WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
+WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.2.1"
+VERSION  = "3.3.0"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -220,6 +222,34 @@ _WALK_SEM   = threading.Semaphore(3)   # codedew rate-limits parallel walks
 _hls_cache  = {}                       # zipper -> (expires, master, embed)
 _hls_lock   = threading.Lock()
 
+# ---- stale-while-revalidate infra -----------------------------------------
+# Cards must ALWAYS show: a transient upstream failure may never remove a
+# previously-playable card.  So caches keep their last-good value forever;
+# reads past the fresh window serve the stale value instantly and refresh
+# in the background (deduped).  Play time (/mq/...) still re-resolves in
+# the fresh window, so the player never gets an expired signed master.
+_bg_lock     = threading.Lock()
+_bg_inflight = set()
+
+
+def _bg_once(key, fn):
+    """Run fn() in a daemon thread, deduped per key while running."""
+    with _bg_lock:
+        if key in _bg_inflight:
+            return
+        _bg_inflight.add(key)
+
+    def _wrap():
+        try:
+            fn()
+        except Exception:
+            pass
+        finally:
+            with _bg_lock:
+                _bg_inflight.discard(key)
+
+    threading.Thread(target=_wrap, daemon=True).start()
+
 
 def _zipper_walk(zipper, deadline):
     """Follow codedew's 3-step 'Security Scan' wall.  Each wall page has
@@ -249,15 +279,28 @@ def _zipper_walk(zipper, deadline):
     return text, None
 
 
-def _mq_resolve(zipper):
+def _mq_resolve(zipper, stale_ok=False):
     """zipper -> (master_m3u8_url, embed_url).  Wall -> argon iframe ->
-    embed page -> juicy blob -> JWPlayer config.  Cached (HLS_TTL /
-    NEG_TTL)."""
+    embed page -> juicy blob -> JWPlayer config.
+
+    stale_ok=False (PLAY time): fresh window only (HLS_TTL, 30 min) - a
+    signed master past its window is re-walked so the player never gets
+    an expired URL.  stale_ok=True (CARD LISTING): any last-good master
+    is served instantly and refreshed in the background; a fresh-walk
+    failure keeps the stale value instead of negative-caching it, so an
+    existing card can never disappear because of a transient error."""
     now = time.time()
     with _hls_lock:
         hit = _hls_cache.get(zipper)
-        if hit and hit[0] > now:
-            return hit[1], hit[2]
+    if hit:
+        exp, master, embed = hit
+        if master and (exp > now or stale_ok):
+            if exp <= now:                       # stale serve -> refresh
+                _bg_once(("mq", zipper),
+                         lambda: _mq_resolve(zipper))
+            return master, embed
+        if not master and exp > now:
+            return None, None                    # inside negative window
     embed = master = None
     deadline = time.monotonic() + WALK_BUDGET
     try:
@@ -272,10 +315,16 @@ def _mq_resolve(zipper):
                     master = mm.group(1).replace("\\/", "/")
     except Exception:
         pass
+    if master:
+        with _hls_lock:
+            _hls_cache[zipper] = (now + HLS_TTL, master, embed)
+        return master, embed
+    if hit and hit[1]:                           # keep the card alive
+        _bg_once(("mq", zipper), lambda: _mq_resolve(zipper))
+        return hit[1], hit[2]
     with _hls_lock:
-        _hls_cache[zipper] = (now + (HLS_TTL if master else NEG_TTL),
-                              master, embed)
-    return master, embed
+        _hls_cache[zipper] = (now + NEG_TTL, None, None)
+    return None, None
 
 
 def _mq_token(zipper):
@@ -323,13 +372,23 @@ def _wn_inner(u):
     return u
 
 
-def _wn_resolve(zipper):
-    """WatchNow page -> best direct file URL (Range-capable), or None."""
+def _wn_resolve(zipper, stale_ok=False):
+    """WatchNow page -> best direct file URL (Range-capable), or None.
+    Same stale-while-revalidate contract as _mq_resolve; the stale
+    window is capped at 6h because the signed link itself expires 8h
+    after signing."""
     now = time.time()
     with _hls_lock:
         hit = _wn_cache.get(zipper)
-        if hit and hit[0] > now:
-            return hit[1]
+    if hit:
+        exp, url = hit
+        if url and (exp > now or (stale_ok and now - exp < WN_STALE)):
+            if exp <= now:                       # stale serve -> refresh
+                _bg_once(("wn", zipper),
+                         lambda: _wn_resolve(zipper))
+            return url
+        if not url and exp > now:
+            return None                          # inside negative window
     url = None
     try:
         text, _ = _zipper_walk(zipper,
@@ -348,9 +407,16 @@ def _wn_resolve(zipper):
                 url = _wn_inner(srcs[0]["url"])
     except Exception:
         url = None
+    if url:
+        with _hls_lock:
+            _wn_cache[zipper] = (now + WN_TTL, url)
+        return url
+    if hit and hit[1] and now - hit[0] < WN_STALE:   # keep the card alive
+        _bg_once(("wn", zipper), lambda: _wn_resolve(zipper))
+        return hit[1]
     with _hls_lock:
-        _wn_cache[zipper] = (now + (HLS_TTL if url else NEG_TTL), url)
-    return url
+        _wn_cache[zipper] = (now + NEG_TTL, None)
+    return None
 
 
 def _resolve_wn(cands, budget=LIST_BUDGET):
@@ -365,7 +431,7 @@ def _resolve_wn(cands, budget=LIST_BUDGET):
         for z in zippers[:2]:
             if time.monotonic() > deadline:
                 return
-            u = _wn_resolve(z)
+            u = _wn_resolve(z, stale_ok=True)
             if u:
                 with lock:
                     out[lang] = u
@@ -531,7 +597,7 @@ def _resolve_picks(picks, done=None, budget=LIST_BUDGET):
         for z in zippers[:3]:
             if time.monotonic() > deadline:
                 return
-            master, _ = _mq_resolve(z)
+            master, _ = _mq_resolve(z, stale_ok=True)
             if master:
                 with lock:
                     out[lang] = (master, z)
@@ -835,15 +901,48 @@ def handle_stream(mtype, mid):
     picks = _picks(rows)
     if not picks:
         return {"streams": []}
-    resolved = _resolve_picks(picks)
 
-    # freshness retry: some language failed (rotated zippers) or the
-    # requested episode is not in the merged view -> force one more
-    # live parse and retry with fresh zippers.
+    # movies: collect the WatchNow pool up front so the MQ and WN walks
+    # run CONCURRENTLY - walking them back-to-back doubled the wait and
+    # was the "cards take forever" complaint.
+    def _wn_pool(rows_):
+        wc = {}
+        for r in rows_:
+            if r.get("btn") != "watchnow":
+                continue
+            lang = _lang_label(r.get("lang"))
+            z = r.get("mq")
+            if z:
+                lst = wc.setdefault(lang, [])
+                if z not in lst:
+                    lst.append(z)
+        return wc
+
+    def _pools(rows_, picks_, wc_):
+        dl = time.monotonic() + LIST_BUDGET
+        box = {"wn": {}}
+        ts = [threading.Thread(
+            target=lambda b=box: b.update(mq=_resolve_picks(picks_)),
+            daemon=True)]
+        if wc_:
+            ts.append(threading.Thread(
+                target=lambda b=box: b.update(wn=_resolve_wn(wc_)),
+                daemon=True))
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(max(0.5, dl - time.monotonic()))
+        return box.get("mq") or {}, box.get("wn") or {}
+
+    wn_cands = _wn_pool(rows) if rec["movie"] else {}
+    resolved, wn_resolved = _pools(rows, picks, wn_cands)
+
+    # requested episode absent from the merged view -> ONE synchronous
+    # live refresh + retry (a brand-new episode must show on first tap).
     has_req = any((season is None or (r.get("season") or 1) == season)
                   and (episode is None or (r.get("episode") or 1) == episode)
                   for r in rows)
-    if not has_req or len(resolved) < len(picks):
+    if not has_req:
         with _live_lock:
             _live_cache.pop(rec.get("hub"), None)
         try:
@@ -854,7 +953,42 @@ def handle_stream(mtype, mid):
             _absorb_live(rec, live, season)
             rows = _rows_for(rec, season, episode)
             picks = _picks(rows)
-            resolved = _resolve_picks(picks, done=resolved)
+            wn_cands = _wn_pool(rows) if rec["movie"] else {}
+            resolved, wn_resolved = _pools(rows, picks, wn_cands)
+    elif len(resolved) < len(picks) or (wn_cands and not wn_resolved):
+        # partial resolve (a language/zipper failed): SERVE what we have
+        # now - the user waits no extra second - and finish the missing
+        # pieces in the background so the next request is complete.
+        def _fin(rec=rec, season=season, episode=episode):
+            with _live_lock:
+                _live_cache.pop(rec.get("hub"), None)
+            live = _live_rows(rec)
+            if live:
+                _absorb_live(rec, live, season)
+            fr = _rows_for(rec, season, episode)
+            fp = _picks(fr)
+            if fp:
+                _resolve_picks(fp)
+            wc = _wn_pool(fr) if rec["movie"] else {}
+            if wc:
+                _resolve_wn(wc)
+        _bg_once(("fin", rec.get("hub"), season, episode), _fin)
+
+    # series: pre-resolve the NEXT episode in the background - pressing
+    # "next" then shows cards instantly.
+    if not rec["movie"] and season is not None and episode:
+        nxt = _rows_for(rec, season, episode + 1)
+        zp = {}
+        for r in nxt:
+            z = r.get("mq") or r.get("sb")
+            if z:
+                zl = _lang_label(r.get("lang"))
+                lst = zp.setdefault(zl, [])
+                if z not in lst:
+                    lst.append(z)
+        if zp:
+            _bg_once(("pre", rec.get("hub"), season, episode),
+                     lambda: _resolve_picks(zp))
 
     dub_show = "dubbed" in (rec.get("site_name") or "").lower()
     has_dub = any(_lang_label(lang).lower() == "hindi" for lang in resolved)
@@ -869,27 +1003,13 @@ def handle_stream(mtype, mid):
             note = "site has no dub for this episode yet"
         streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base))
 
-    # WatchNow direct sources (movies): the VidStack player pages embed
-    # signed direct file URLs (Range-capable) - one WatchNow zipper per
-    # language lives on the hub.  Offer them as an extra card per
-    # language after the MQ cards.
-    if rec["movie"]:
-        wn_cands = {}
-        for r in rows:
-            if r.get("btn") != "watchnow":
-                continue
-            lang = _lang_label(r.get("lang"))
-            z = r.get("mq")
-            if z:
-                lst = wn_cands.setdefault(lang, [])
-                if z not in lst:
-                    lst.append(z)
-        wn_resolved = _resolve_wn(wn_cands)
-        for lang in picks:                 # keep card order stable
-            u = wn_resolved.get(lang)
-            if u:
-                streams.append(_phx_card(rec, lang, prefix, ep_title,
-                                         "", u, base, src="WN"))
+    # WatchNow direct sources (movies): signed per-language file URLs
+    # the player hits directly (Range-capable, no proxy).
+    for lang in picks:                     # keep card order stable
+        u = wn_resolved.get(lang)
+        if u:
+            streams.append(_phx_card(rec, lang, prefix, ep_title,
+                                     "", u, base, src="WN"))
     return {"streams": streams}
 
 # ---------------------------------------------------- /mq HLS rewriter -----
