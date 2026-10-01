@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.4"
+VERSION  = "3.3.5"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -431,9 +431,9 @@ def _wn_resolve(zipper, stale_ok=False):
 
 
 def _resolve_wn(cands, budget=LIST_BUDGET):
-    """{lang: [watchnow-zippers]} -> {lang: (direct_url, kind)},
-    parallel.  A language's range-capable (fsl) page always wins; the
-    range-hostile googleusercontent (10g) page is only a fallback."""
+    """{lang: [watchnow-zippers]} -> {lang: (direct_url, kind, zipper)},
+    parallel.  ONLY range-capable (fsl/R2) pages qualify - google-
+    hosted WatchNow files cannot stream-seek, so no card for them."""
     out = {}
     if not cands:
         return out
@@ -441,22 +441,19 @@ def _resolve_wn(cands, budget=LIST_BUDGET):
     lock = threading.Lock()
 
     def _run(lang, zippers):
-        fb = None
+        # PLAYABLE-ONLY: a WatchNow card is emitted only for range-
+        # capable R2 sources.  googleusercontent (10g) answers ranged
+        # GETs with 200+whole-file too often - those files cannot
+        # stream-seek in a player, so offering them just clutters the
+        # list with cards that stall (the MQ card covers that title).
         for z in zippers[:3]:
             if time.monotonic() > deadline:
                 return
             u, kind = _wn_resolve(z, stale_ok=True)
-            if not u:
-                continue
-            if kind == "fsl":
+            if u and kind == "fsl":
                 with lock:
                     out[lang] = (u, kind, z)
                 return
-            if fb is None:
-                fb = (u, kind, z)  # 10g: keep looking for an fsl page
-        if fb:
-            with lock:
-                out[lang] = fb
 
     threads = [threading.Thread(target=_run, args=(l, zs), daemon=True)
                for l, zs in cands.items()]
