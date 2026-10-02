@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.4.1"
+VERSION  = "3.4.2"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -762,6 +762,54 @@ def _cinemeta_name(mtype, ext_id):
 _search_cache = {}                         # (title, want_movie) -> slug
 
 
+_SEO_SLUG = {"hindi", "dubbed", "dub", "episodes", "episode", "download",
+             "hd", "season", "movie", "480p", "720p", "1080p", "2160p",
+             "4k", "web", "dl", "hin", "tam", "tel", "ben", "eng", "sub"}
+
+
+def _slug_is_movie(slug):
+    s = (slug or "").lower()
+    return "movie" in s and "episodes" not in s
+
+
+def _ensure_show(slug, hub_url, site_title, cinemeta_name):
+    """Create a live show record for a hub that exists on the site but is
+    missing from the crawler snapshot (brand-new shows).  Episodes come
+    from the usual live-hub parse, so nothing else needs to know."""
+    with STORE_LOCK:
+        rec = SHOWS.get(slug)
+        if rec:
+            return rec
+        rec = {"slug": slug,
+               "site_name": site_title or slug.replace("_", " ").title(),
+               "name": cinemeta_name or site_title
+                       or slug.replace("_", " ").title(),
+               "movie": _slug_is_movie(slug),
+               "poster": "", "hub": hub_url, "eps": {}}
+        SHOWS[slug] = rec
+    _bg_once(("poster", slug),
+             lambda: _fetch_poster(rec))
+    return rec
+
+
+def _fetch_poster(rec):
+    """Lazy og:image grab so dynamically-discovered shows get a poster."""
+    try:
+        if rec.get("poster") or not rec.get("hub"):
+            return
+        t = upstream_get(rec["hub"], referer=SITE, timeout=10).text or ""
+        q = chr(39)
+        dd = chr(34)
+        og = (re.search(r'property=["' + q + r']og:image["' + q + r']'
+                        r'[^>]*content=["' + q + r']([^"' + q + r']+)', t)
+              or re.search(r'content=["' + q + r']([^"' + q + r']+)["' + q
+                           + r'][^>]*property=["' + q + r']og:image', t))
+        if og:
+            rec["poster"] = og.group(1).replace(dd + dd, dd)
+    except Exception:
+        pass
+
+
 def _site_search_slug(title, want_movie):
     """The site's own WordPress search - the ground truth for its naming
     ("Crayon Shin-chan ..." finds "Shin Chan Movie ..." instantly even
@@ -785,6 +833,7 @@ def _site_search_slug(title, want_movie):
         variants = list(dict.fromkeys(v for v in variants if len(v) >= 6))[:3]
         wt = _toks(title)
         best, bs = None, 0.0
+        best_href = best_label = ""
         for qv in variants:
             items = []
             for _att in (1, 2):              # CF blips: one retry
@@ -797,24 +846,34 @@ def _site_search_slug(title, want_movie):
                 if items:
                     break
                 time.sleep(0.8)
-            for href, _label in items:
+            for href, label in items:
                 if "/hindi/" not in href:
                     continue
                 cand = href.rstrip("/").rsplit("/", 1)[-1].replace("-", "_")
                 rec = SHOWS.get(cand)
-                if not rec or bool(rec["movie"]) != want_movie:
-                    continue
-                shared = wt & _toks(_base_title(rec))
+                if rec:
+                    if bool(rec["movie"]) != want_movie:
+                        continue
+                    ref = _toks(_base_title(rec))
+                else:
+                    # brand-new show (not in the crawler snapshot yet):
+                    # score against the slug itself, SEO words stripped
+                    if _slug_is_movie(cand) != want_movie:
+                        continue
+                    ref = _toks(cand) - _SEO_SLUG
+                shared = wt & ref
                 if len(shared) < 3:
                     continue
-                s = len(shared) / max(1, min(len(wt),
-                                             len(_toks(_base_title(rec)))))
+                s = len(shared) / max(1, min(len(wt), len(ref)))
                 if s > bs:
                     best, bs = cand, s
+                    best_href, best_label = href, (label or "").strip()
             if best and bs >= 0.5:
                 break
         if best and bs >= 0.5:
             slug = best
+            if best not in SHOWS and best_href:
+                _ensure_show(best, best_href, best_label, title)
     except Exception:
         slug = None
     with _hls_lock:
@@ -825,9 +884,14 @@ def _site_search_slug(title, want_movie):
 _calt_cache = {}
 
 
-def _cinemeta_alts(mtype, ext_id):
-    """Alternative titles from Cinemeta's own search (parallel companion
-    to _cinemeta_name) - tried when the meta name matches nothing."""
+_IMDB_SUG = "https://v2.sg.media-imdb.com/suggestion/{k}/{q}.json"
+
+
+def _imdb_names(mtype, ext_id):
+    """Display titles for ext_id from IMDb's suggestion CDN (no auth,
+    reliable) - the ENGLISH name when Cinemeta's meta only carries the
+    romaji/original ("Super no ura de yani su futari").  Replaces the
+    old cinemeta-search-by-id call, which never matched anything."""
     now = time.time()
     key = (mtype, ext_id)
     with _cine_lock:
@@ -836,16 +900,13 @@ def _cinemeta_alts(mtype, ext_id):
         return hit[1]
     alts = []
     try:
-        r = requests.get(
-            f"https://v3-cinemeta.strem.io/search/{mtype}/{quote_plus(ext_id)}.json"
-            if False else
-            f"https://v3-cinemeta.strem.io/search/{mtype}/{ext_id}.json",
-            timeout=6, headers={"User-Agent": UA,
-                                "Accept": "application/json"})
+        r = requests.get(_IMDB_SUG.format(k=(ext_id[2:3] or "x").lower(),
+                                          q=ext_id),
+                         timeout=6, headers={"User-Agent": UA,
+                                             "Accept": "application/json"})
         if r.status_code == 200:
-            alts = [(x.get("name") or "") for x in
-                    (r.json().get("metas") or [])[:5]]
-            alts = [a for a in alts if a]
+            alts = [x.get("l") for x in (r.json().get("d") or [])
+                    if x.get("id") == ext_id and x.get("l")]
     except Exception:
         alts = []
     with _cine_lock:
@@ -1080,6 +1141,8 @@ def handle_meta(mtype, mid):
         _absorb_live(rec, _live_rows(rec))
     except Exception:
         pass
+    if not rec.get("poster"):
+        _fetch_poster(rec)
     if rec.get("movie"):
         # SPEED: the detail page opens ~1-3 s before the play tap ->
         # walk this movie's zippers in the background NOW so the
@@ -1167,7 +1230,7 @@ def handle_stream(mtype, mid):
                     s=_site_search_slug(title, mtype == "movie")),
                     daemon=True),
                 threading.Thread(target=lambda b=box: b.update(
-                    a=_cinemeta_alts(mtype, parts[0])), daemon=True)]
+                    a=_imdb_names(mtype, parts[0])), daemon=True)]
             for t0_ in ths:
                 t0_.start()
             dl = time.monotonic() + 12
@@ -1177,7 +1240,9 @@ def handle_stream(mtype, mid):
             if not rec:
                 for alt in (box.get("a") or []):
                     rec = (_match_show(alt, season, mtype)
-                           or _sim_match(alt, season, mtype))
+                           or _sim_match(alt, season, mtype)
+                           or SHOWS.get(_site_search_slug(
+                               alt, mtype == "movie") or ""))
                     if rec:
                         break
     else:
