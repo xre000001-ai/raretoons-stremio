@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.4.0"
+VERSION  = "3.4.1"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -223,6 +223,43 @@ _WALL_RE   = re.compile(r'data-href="([^"]+)"')
 _WALK_SEM   = threading.Semaphore(3)   # codedew rate-limits parallel walks
 _hls_cache  = {}                       # zipper -> (expires, master, embed)
 _hls_lock   = threading.Lock()
+_mqres_cache = {}                      # master URL -> (expires, "1080p")
+_RES_RE = re.compile(r"(?i)(?<![0-9x])(2160|1080|720|480|360)\s*p(?![0-9])")
+_MASTER_RES_RE = re.compile(r"RESOLUTION=\d+x(\d+)", re.I)
+
+
+def _res_label(text):
+    """'...1080p...' / '4k (Untouched) 17 GB' -> '1080p' / '2160p'."""
+    t = text or ""
+    m = _RES_RE.search(t)
+    if m:
+        return f"{m.group(1)}p"
+    if re.search(r"(?i)(?<![a-z0-9])4k(?![a-z0-9])", t):
+        return "2160p"
+    return ""
+
+
+def _master_quality(master):
+    """Highest variant height of an MQ master playlist, cached 6 h.
+    Only called inside an already-paid time window (card resolve /
+    play rewrite) so cards never wait an extra second for it."""
+    now = time.time()
+    with _hls_lock:
+        hit = _mqres_cache.get(master)
+    if hit and hit[0] > now:
+        return hit[1]
+    q = ""
+    try:
+        r = upstream_get(master, referer=ARGON, timeout=5)
+        if r.status_code == 200:
+            hs = [int(h) for h in _MASTER_RES_RE.findall(r.text or "")]
+            if hs:
+                q = f"{max(hs)}p"
+    except Exception:
+        q = ""
+    with _hls_lock:
+        _mqres_cache[master] = (now + (6 * 3600 if q else 1800), q)
+    return q
 
 # ---- stale-while-revalidate infra -----------------------------------------
 # Cards must ALWAYS show: a transient upstream failure may never remove a
@@ -445,7 +482,7 @@ def _resolve_wn(cands, budget=LIST_BUDGET):
         # (plays fine, seeks best-effort) so every language that has a
         # WatchNow button gets its card, series and movies alike.
         fb = None
-        for z in zippers[:3]:
+        for z, qn in zippers[:3]:
             if time.monotonic() > deadline:
                 return
             u, kind = _wn_resolve(z, stale_ok=True)
@@ -453,10 +490,10 @@ def _resolve_wn(cands, budget=LIST_BUDGET):
                 continue
             if kind == "fsl":
                 with lock:
-                    out[lang] = (u, kind, z)
+                    out[lang] = (u, kind, z, qn)
                 return
             if fb is None:
-                fb = (u, kind, z)
+                fb = (u, kind, z, qn)
         if fb:
             with lock:
                 out[lang] = fb
@@ -523,46 +560,52 @@ def _live_rows(rec):
                 r"1080p?|720p?|480p?|blu[- ]?ray|web[- ]?dl|hd)\b")
             heads = []
             cur = None
+            cur_q = ""
             for hm in re.finditer(r"<h4[^>]*>(.*?)</h4>", page, re.S):
                 htxt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", hm.group(1)))
                 lang = next((L for L in _LIVE_LANGS
                              if re.search(rf"\b{L}\b", htxt, re.I)), None)
-                if lang:
+                if _quality_head.search(htxt):
+                    cur_q = htxt          # "(Untouched) 4.63 GB" annotates
+                if lang:                  #   the buttons that follow it
                     cur = lang
+                    cur_q = ""            # new language section resets
                 elif not _quality_head.search(htxt):
                     cur = None
-                heads.append((hm.start(), cur))
+                    cur_q = ""
+                heads.append((hm.start(), cur, cur_q))
             heads.sort()
 
             def _lang_at(pos):
-                lang = None
-                for hpos, hlang in heads:
+                lang = q = None
+                for hpos, hlang, hq in heads:
                     if hpos <= pos:
-                        lang = hlang
+                        lang, q = hlang, hq
                     else:
                         break
-                return lang
+                return lang, (q or "")
 
             cands = []
             for mm in _ALL_BTN_RE.finditer(page):
                 label = mm.group(2).strip().lower()
                 if label not in _BTN_W:
                     continue          # HubCloud/DLBeta/Mega/MediaFire/...
-                lang = _lang_at(mm.start())
+                lang, qn = _lang_at(mm.start())
                 if lang:
-                    cands.append((_BTN_W[label], lang, mm.group(1), label))
+                    cands.append((_BTN_W[label], lang, mm.group(1), label,
+                                  qn))
             # dedupe per language, priority order, max 3 candidates
             best = {}
-            for w, lang, url, label in sorted(cands):
+            for w, lang, url, label, qn in sorted(cands):
                 lst = best.setdefault(lang, [])
-                if all(u != url for u, _ in lst) and len(lst) < 3:
-                    lst.append((url, label))
+                if all(u != url for u, _l, _q in lst) and len(lst) < 3:
+                    lst.append((url, label, qn))
             for lang, pairs in best.items():
-                for u, label in pairs:
+                for u, label, qn in pairs:
                     rows.append({"show": rec["site_name"], "season": 0,
                                  "episode": 1, "ep_title": "", "lang": lang,
                                  "hub_url": hub, "mq": u, "sb": "",
-                                 "btn": label})
+                                 "btn": label, "qn": qn})
         else:
             eps = [(mm.start(), int(mm.group(1)))
                    for mm in _EP_POS_RE.finditer(page)]
@@ -661,8 +704,13 @@ def _resolve_picks(picks, done=None, budget=LIST_BUDGET):
                 return
             master, _ = _mq_resolve(z, stale_ok=True)
             if master:
+                # spare budget -> highest variant resolution for the
+                # card label; the join waits for the same deadline
+                # anyway, so this can never delay the listing
+                q = (_master_quality(master)
+                     if time.monotonic() < deadline - 1 else "")
                 with lock:
-                    out[lang] = (master, z)
+                    out[lang] = (master, z, q)
                 return
 
     threads = [threading.Thread(target=_run, args=(l, zs), daemon=True)
@@ -942,7 +990,7 @@ def _clip(text, limit):
 
 
 def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
-              kind="fsl"):
+              kind="fsl", qres=""):
     """Phoenix-style stream card (MQ = in-app HLS, WN = direct MKV)."""
     sub = " · sub" if lang.lower().endswith("sub") else ""
     lang0 = re.sub(r"\s*sub\s*$", "", lang, flags=re.I).strip() or lang
@@ -962,11 +1010,12 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
         # DIRECTLY gets real byte-range seeking (how the IC cards work).
         name, binge, fname = "◫ WN ◫", f"rt2|wn|{lang.lower()}", f"{prefix}.mkv"
         url = zipper
-        line3 = ("⊞ RareToons ◧ WN · Untouched MKV"
+        wq = f" · {qres}" if qres else ""
+        line3 = ("⊞ RareToons ◧ WN" + wq + " · Untouched MKV"
                  if kind == "fsl"
-                 else "⊞ RareToons ◧ WN · Untouched (progressive)")
+                 else "⊞ RareToons ◧ WN" + wq + " · Untouched (progressive)")
     else:
-        line3 = "⊞ RareToons ◧ MQ 1080·720·360"
+        line3 = "⊞ RareToons ◧ MQ" + (f" · {qres}" if qres else "")
         name, binge, fname = "◫ MQ ◫", f"rt2|mq|{lang.lower()}", f"{prefix}.m3u8"
         url = f"{base}/mq/{_mq_token(zipper)}.m3u8"
     if note:
@@ -1031,6 +1080,32 @@ def handle_meta(mtype, mid):
         _absorb_live(rec, _live_rows(rec))
     except Exception:
         pass
+    if rec.get("movie"):
+        # SPEED: the detail page opens ~1-3 s before the play tap ->
+        # walk this movie's zippers in the background NOW so the
+        # /stream request finds warm caches and shows cards instantly.
+        def _prewarm(rec=rec):
+            try:
+                picks, wc = {}, {}
+                for r in _rows_for(rec, None, None):
+                    z, lang = r.get("mq"), _lang_label(r.get("lang"))
+                    if not z:
+                        continue
+                    if r.get("btn") == "watchnow":
+                        lst = wc.setdefault(lang, [])
+                        if all(z != z0 for z0, _q in lst):
+                            lst.append((z, r.get("qn") or ""))
+                    else:
+                        lst = picks.setdefault(lang, [])
+                        if z not in lst:
+                            lst.append(z)
+                if picks:
+                    _resolve_picks(picks)
+                if wc:
+                    _resolve_wn(wc)
+            except Exception:
+                pass
+        _bg_once(("prewarm-movie", slug), _prewarm)
     meta = {
         "id": mid,
         "type": mtype,
@@ -1150,8 +1225,8 @@ def handle_stream(mtype, mid):
             z = r.get("mq")
             if z:
                 lst = wc.setdefault(lang, [])
-                if z not in lst:
-                    lst.append(z)
+                if all(z != z0 for z0, _q in lst):
+                    lst.append((z, r.get("qn") or ""))
         return wc
 
     def _pools(rows_, picks_, wc_):
@@ -1249,20 +1324,22 @@ def handle_stream(mtype, mid):
         hit = resolved.get(lang)
         if not hit:
             continue                       # PLAYABLE-ONLY: no card at all
-        master, z = hit
+        master, z, mq_q = hit
         note = ""
         if dub_show and lang.lower() == "hindi sub" and not has_dub:
             note = "site has no dub for this episode yet"
-        streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base))
+        streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base,
+                                 qres=mq_q))
 
     # WatchNow direct sources (movies): signed per-language file URLs.
     # fsl -> direct; 10g -> same-origin /wn slice-proxy.
     for lang in picks:                     # keep card order stable
         hit = wn_resolved.get(lang)
         if hit:
-            u, kind, z = hit
-            streams.append(_phx_card(rec, lang, prefix, ep_title,
-                                     "", u, base, src="WN", kind=kind))
+            u, kind, z, qn = hit
+            wq = _res_label(unquote(u.split("?")[0])) or _res_label(qn)
+            streams.append(_phx_card(rec, lang, prefix, ep_title, "", u,
+                                     base, src="WN", kind=kind, qres=wq))
     return {"streams": streams}
 
 # ---------------------------------------------------- /mq HLS rewriter -----
@@ -1379,6 +1456,11 @@ def _serve_m3u8_master(handler, zipper):
             if r.status_code != 200:
                 handler._send({"error": f"master {r.status_code}"}, 502)
                 return
+        hs = [int(h) for h in _MASTER_RES_RE.findall(r.text or "")]
+        if hs:
+            with _hls_lock:
+                _mqres_cache[master] = (time.time() + 6 * 3600,
+                                        f"{max(hs)}p")
         body = _rewrite_m3u8(r.text or "", master,
                              f"/mq/{_mq_token(zipper)}").encode()
         handler._send_raw(body, CONTENT_TYPES[".m3u8"])
