@@ -76,7 +76,7 @@ WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
 
-VERSION  = "3.3.9"
+VERSION  = "3.4.0"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -711,6 +711,100 @@ def _cinemeta_name(mtype, ext_id):
     return name
 
 
+_search_cache = {}                         # (title, want_movie) -> slug
+
+
+def _site_search_slug(title, want_movie):
+    """The site's own WordPress search - the ground truth for its naming
+    ("Crayon Shin-chan ..." finds "Shin Chan Movie ..." instantly even
+    when Cinemeta's branding defeats the substring matcher).  Returns a
+    SHOWS slug or None.  Results are token-scored, best first."""
+    now = time.time()
+    key = (title, want_movie)
+    with _hls_lock:
+        hit = _search_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    slug = None
+    try:
+        from urllib.parse import quote_plus
+        # query variants: the site's engine returns a "no results" page
+        # for long branded phrasings - the post-colon distinctive part
+        # usually hits directly.
+        variants = [title]
+        if ":" in title:
+            variants.append(title.rsplit(":", 1)[-1].strip())
+        variants = list(dict.fromkeys(v for v in variants if len(v) >= 6))[:3]
+        wt = _toks(title)
+        best, bs = None, 0.0
+        for qv in variants:
+            items = []
+            for _att in (1, 2):              # CF blips: one retry
+                r = upstream_get(f"{SITE}/?s={quote_plus(qv)}",
+                                 referer=SITE, timeout=12)
+                items = re.findall(
+                    r'<h[23][^>]*class="[^"]*entry-title[^"]*"[^>]*>\s*'
+                    r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                    r.text or "", re.S)
+                if items:
+                    break
+                time.sleep(0.8)
+            for href, _label in items:
+                if "/hindi/" not in href:
+                    continue
+                cand = href.rstrip("/").rsplit("/", 1)[-1].replace("-", "_")
+                rec = SHOWS.get(cand)
+                if not rec or bool(rec["movie"]) != want_movie:
+                    continue
+                shared = wt & _toks(_base_title(rec))
+                if len(shared) < 3:
+                    continue
+                s = len(shared) / max(1, min(len(wt),
+                                             len(_toks(_base_title(rec)))))
+                if s > bs:
+                    best, bs = cand, s
+            if best and bs >= 0.5:
+                break
+        if best and bs >= 0.5:
+            slug = best
+    except Exception:
+        slug = None
+    with _hls_lock:
+        _search_cache[key] = (now + (6 * 3600 if slug else 600), slug)
+    return slug
+
+
+_calt_cache = {}
+
+
+def _cinemeta_alts(mtype, ext_id):
+    """Alternative titles from Cinemeta's own search (parallel companion
+    to _cinemeta_name) - tried when the meta name matches nothing."""
+    now = time.time()
+    key = (mtype, ext_id)
+    with _cine_lock:
+        hit = _calt_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    alts = []
+    try:
+        r = requests.get(
+            f"https://v3-cinemeta.strem.io/search/{mtype}/{quote_plus(ext_id)}.json"
+            if False else
+            f"https://v3-cinemeta.strem.io/search/{mtype}/{ext_id}.json",
+            timeout=6, headers={"User-Agent": UA,
+                                "Accept": "application/json"})
+        if r.status_code == 200:
+            alts = [(x.get("name") or "") for x in
+                    (r.json().get("metas") or [])[:5]]
+            alts = [a for a in alts if a]
+    except Exception:
+        alts = []
+    with _cine_lock:
+        _calt_cache[key] = (now + (6 * 3600 if alts else 1200), alts)
+    return alts
+
+
 def _norm_title(text):
     return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
@@ -727,6 +821,46 @@ def _base_title(rec):
     n = re.sub(r"\bseason\s*\d+\b", " ", n, flags=re.I)
     n = re.sub(r"\bepisodes\b", " ", n, flags=re.I)
     return re.sub(r"\s+", " ", n).strip(" -–")
+
+
+_SIM_STOP = {"the", "a", "an", "of", "to", "in", "vs", "no", "part",
+             "movie", "season", "episode", "episodes", "hindi", "dubbed",
+             "subbed", "download", "watch", "online", "full", "hd", "tv"}
+
+
+def _toks(text):
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if w not in _SIM_STOP and len(w) > 1}
+
+
+def _sim_match(title, season, mtype):
+    """Word-token similarity fallback for the strict substring matcher:
+    catches branded Cinemeta names ("Crayon Shin-chan: Action Kamen vs
+    Higure Rakshas" vs the site's "Shin Chan Movie Action Kamen vs
+    Higure Rakshas").  Requires >=3 shared distinctive words covering
+    >=60% of the smaller side; type and season filters still apply."""
+    wa = _toks(title)
+    if len(wa) < 3:
+        return None
+    want_movie = mtype == "movie"
+    best, bs = None, 0.0
+    for rec in SHOWS.values():
+        if bool(rec["movie"]) != want_movie:
+            continue
+        wb = _toks(_base_title(rec))
+        shared = wa & wb
+        if len(shared) < 3:
+            continue
+        s = len(shared) / max(1, min(len(wa), len(wb)))
+        if s > bs:
+            best, bs = rec, s
+    if not best or bs < 0.6:
+        return None
+    if season is not None:
+        with STORE_LOCK:
+            if not any(k[0] == season for k in best["eps"]):
+                return None
+    return best
 
 
 def _match_show(title, season, mtype="series"):
@@ -947,6 +1081,30 @@ def handle_stream(mtype, mid):
             pass
         title = _cinemeta_name(mtype, parts[0])
         rec = _match_show(title, season, mtype) if title else None
+        if not rec and title:
+            rec = _sim_match(title, season, mtype)
+        if not rec and title:
+            # ALTERNATIVE-NAME PARALLEL FETCH: the site's own search and
+            # Cinemeta's alt titles race; either may rescue the match.
+            box = {}
+            ths = [
+                threading.Thread(target=lambda b=box: b.update(
+                    s=_site_search_slug(title, mtype == "movie")),
+                    daemon=True),
+                threading.Thread(target=lambda b=box: b.update(
+                    a=_cinemeta_alts(mtype, parts[0])), daemon=True)]
+            for t0_ in ths:
+                t0_.start()
+            dl = time.monotonic() + 12
+            for t0_ in ths:
+                t0_.join(max(0.5, dl - time.monotonic()))
+            rec = SHOWS.get(box.get("s") or "")
+            if not rec:
+                for alt in (box.get("a") or []):
+                    rec = (_match_show(alt, season, mtype)
+                           or _sim_match(alt, season, mtype))
+                    if rec:
+                        break
     else:
         return {"streams": []}
     if not rec:
@@ -1228,8 +1386,7 @@ def _serve_m3u8_master(handler, zipper):
         handler._send({"error": f"master: {exc}"}, 502)
 
 
-def _serve_m3u8_child(handler, zipper, b64url, ext, rt="",
-                      open_rng=False):
+def _serve_m3u8_child(handler, zipper, b64url, ext, rt=""):
     target = _u64d(b64url)
     if not target.startswith("http"):
         handler._send({"error": "bad child"}, 400)
@@ -1253,12 +1410,7 @@ def _serve_m3u8_child(handler, zipper, b64url, ext, rt="",
             handler._send_raw(body, CONTENT_TYPES[".m3u8"])
             return
 
-        up_rng = rng
-        if open_rng and rng:                 # /wn slice-proxy: origin may
-            m0 = re.match(r"\s*bytes=(\d+)-", rng)  # honour only START
-            if m0:
-                up_rng = f"bytes={m0.group(1)}-"
-        up = upstream_stream(target, referer=ARGON, rng=up_rng, timeout=30)
+        up = upstream_stream(target, referer=ARGON, rng=rng, timeout=30)
         code = up.status_code
         if code not in (200, 206, 416):
             handler._send({"error": f"child {code}"}, 502)
@@ -1627,7 +1779,7 @@ def public_base_from(handler):
     return f"{proto}://{host}"
 
 
-print("[rt2] BOOT v=" + VERSION + " open_rng=yes", flush=True)
+print("[rt2] BOOT v=" + VERSION, flush=True)
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
