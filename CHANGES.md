@@ -1,3 +1,52 @@
+## v3.5.0 — per-variant cards + Range-proof + /find (main-addon contract)
+
+User directive: *"Raretoons resolver ta ke advance koro — main addon er upore pressure kom pore."*
+
+**Measured before (v3.4.2):** `/stream` returned **one** card per language
+(`◫ MQ ◫ … ⊞ RareToons ◧ MQ · 1080p`), the card URL was the ABR master, the
+player picked the rendition itself, and nothing was verified: a rotated or
+dead zipper still produced a card. The main addon then rebuilt the card
+text, re-ran its own title gate and spent an extra HTTP call on `rtDubMap`.
+
+**Now (v3.5.0):**
+
+1. **One card per variant** — the master is parsed (`RESOLUTION`/`BANDWIDTH`)
+   and every rendition gets its own playlist route
+   `/mq/<token>/p<height>.m3u8` and its own card:
+   `⊞ RareToons ◧ MQ · 1080p · 3.7M · ✓206 · 156MB`.
+2. **Range-proof before any card** — the variant playlist must answer 200
+   with `#EXTINF`, then its **first segment** is requested with
+   `Range: bytes=0-1023` and must answer **206** with a real
+   `Content-Range` (measured: `bytes 0-1023/163748188`). Unproven variants
+   get no card at all; if *nothing* proves, the single legacy card is still
+   served but explicitly tagged `⚠ unproven` (never a fake "proven" claim).
+3. **Size + quality + language in the card text** — straight from the
+   Content-Range total (`156MB`, `65MB`, `37MB` on Doraemon S12E01).
+4. **`/find` endpoint** = the contract the main addon already calls, now
+   returning **render-ready** cards: `card:1`, `title`, `quality`, `lang`,
+   `filename`, `bingeGroup`, `proof{pl,seg,cr,bytes}` + `catalog{show,live,match}`.
+   The main addon (v1.28.4) passes these straight through — no re-gating,
+   no `rtDubMap` call, no per-card rebuild ⇒ less CPU and fewer requests
+   on the main addon.
+5. **`/health`** now reports version, recipe list, cached variant/proof
+   counts and counters (`proofs_ok/bad`, `variant_cards`, `finds`,
+   `finds_empty`, `find_ms`).
+6. `source=toonworld` on this resolver returns an honest empty result
+   (`reason: source not enabled here yet`) instead of leaking RareToons
+   cards under the wrong badge.
+
+**Retry/perf notes:** segment hosts sit behind Cloudflare — plain
+`requests` got `403 text/html` on the probe (measured), the impersonating
+`curl_cffi` client gets `206 video/mp4`; the probe uses the same client as
+the playlist fetches. Proofs are cached (`PROOF_TTL=300s`, failures 60s)
+and are fetched in parallel inside `PROOF_BUDGET=6000ms`, so a cold
+`/find` still lands at **3.3–4.0 s** for 3 variants.
+
+**Local battery (`python3 test_v350.py`)**: 9/9 pass —
+health, cards, render-ready fields, Range-proof (3×206), distinct
+qualities descending, variant playlist 200 + `#EXTM3U`, proxied segment
+206, gibberish title → 0 cards, latency budget.
+
 ## v1.9.0 — zero media bytes through the addon
 
 - **Web+Cast `/proxy` cards removed by default** (`EXPOSE_PROXY_STREAMS` now

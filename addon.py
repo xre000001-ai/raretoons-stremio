@@ -75,8 +75,14 @@ LIVE_NEG        = _env_int("LIVE_NEG", 60)         # empty hub parse cache
 WN_TTL          = _env_int("WN_TTL", 6 * 3600)     # WN signed link (~8h life)
 WN_STALE        = _env_int("WN_STALE", 6 * 3600)   # max stale-serve age, WN
 CINE_TTL        = _env_int("CINE_TTL", 6 * 3600)   # Cinemeta title cache
+# ★ v3.5.0 — per-variant cards + Range-proof
+VAR_TTL         = _env_int("VAR_TTL", 900)         # master -> variant list
+PROOF_TTL       = _env_int("PROOF_TTL", 300)       # proven variant (206) cache
+PROOF_FAIL_TTL  = _env_int("PROOF_FAIL_TTL", 60)   # unproven variant re-probe
+PROOF_BUDGET    = _env_int("PROOF_BUDGET", 6000)   # ms, whole variant-proof pass
+CARD_PROOF      = os.environ.get("CARD_PROOF", "1") != "0"   # 0 = exempt from proof
 
-VERSION  = "3.4.2"
+VERSION  = "3.5.0"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -1051,7 +1057,7 @@ def _clip(text, limit):
 
 
 def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
-              kind="fsl", qres=""):
+              kind="fsl", qres="", vq=0, proof=None, mbps=0.0):
     """Phoenix-style stream card (MQ = in-app HLS, WN = direct MKV)."""
     sub = " · sub" if lang.lower().endswith("sub") else ""
     lang0 = re.sub(r"\s*sub\s*$", "", lang, flags=re.I).strip() or lang
@@ -1075,6 +1081,27 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
         line3 = ("⊞ RareToons ◧ WN" + wq + " · Untouched MKV"
                  if kind == "fsl"
                  else "⊞ RareToons ◧ WN" + wq + " · Untouched (progressive)")
+    elif vq:
+        # ★ v3.5.0: ONE CARD PER VARIANT (360/720/1080 …) - the player gets
+        # the exact rendition it plays, no auto-ABR guess; every card has
+        # already passed the Range-206 proof below.
+        bits = [f"{vq}p"]
+        if mbps:
+            bits.append(f"{mbps:.1f}M")
+        bits.append("✓206")
+        try:
+            tot = int((proof or {}).get("bytes") or 0)
+        except Exception:
+            tot = 0
+        if tot > 0:
+            bits.append(f"{tot / (1024.0 * 1024.0):.0f}MB")
+        if note:
+            bits.append(note)
+        line3 = "⊞ RareToons ◧ MQ · " + " · ".join(bits)
+        name = "◫ MQ ◫"
+        binge = f"rt2|mq|{lang.lower()}|{vq}"
+        fname = f"{prefix}.{vq}p.m3u8"
+        url = f"{base}/mq/{_mq_token(zipper)}/p{vq}.m3u8"
     else:
         line3 = "⊞ RareToons ◧ MQ" + (f" · {qres}" if qres else "")
         name, binge, fname = "◫ MQ ◫", f"rt2|mq|{lang.lower()}", f"{prefix}.m3u8"
@@ -1090,6 +1117,10 @@ def _phx_card(rec, lang, prefix, ep_title, note, zipper, base, src="MQ",
             "bingeGroup": binge,
             "filename": fname,
         },
+        "_lang": lang0, "_src": src, "_q": (f"{vq}" if vq else
+                                           (qres.replace("p", "") if qres else "")),
+        "_kind": "hls" if src == "MQ" else "progressive",
+        "_proof": proof or {}, "_vq": vq,
     }
 
 
@@ -1195,61 +1226,9 @@ def handle_meta(mtype, mid):
     return meta
 
 
-def handle_stream(mtype, mid):
-    """One MQ card per resolvable language.  Foreign tt-ids title-match
-    through Cinemeta.  Every request merges the live hub first (TTL
-    cached): the site rotates movie zippers and adds dubs/episodes
-    continuously, so the crawler snapshot goes stale within hours."""
-    season = episode = None
-    rec = None
-    if mid.startswith("raretoons2:"):
-        parts = mid[len("raretoons2:"):].split(":")
-        rec = SHOWS.get(parts[0])
-        if len(parts) >= 3:
-            try:
-                season, episode = int(parts[-2]), int(parts[-1])
-            except ValueError:
-                pass
-    elif re.match(r"^tt\d+$", mid.split(":")[0] or ""):
-        parts = mid.split(":")
-        try:
-            if len(parts) >= 3:
-                season, episode = int(parts[-2]), int(parts[-1])
-        except ValueError:
-            pass
-        title = _cinemeta_name(mtype, parts[0])
-        rec = _match_show(title, season, mtype) if title else None
-        if not rec and title:
-            rec = _sim_match(title, season, mtype)
-        if not rec and title:
-            # ALTERNATIVE-NAME PARALLEL FETCH: the site's own search and
-            # Cinemeta's alt titles race; either may rescue the match.
-            box = {}
-            ths = [
-                threading.Thread(target=lambda b=box: b.update(
-                    s=_site_search_slug(title, mtype == "movie")),
-                    daemon=True),
-                threading.Thread(target=lambda b=box: b.update(
-                    a=_imdb_names(mtype, parts[0])), daemon=True)]
-            for t0_ in ths:
-                t0_.start()
-            dl = time.monotonic() + 12
-            for t0_ in ths:
-                t0_.join(max(0.5, dl - time.monotonic()))
-            rec = SHOWS.get(box.get("s") or "")
-            if not rec:
-                for alt in (box.get("a") or []):
-                    rec = (_match_show(alt, season, mtype)
-                           or _sim_match(alt, season, mtype)
-                           or SHOWS.get(_site_search_slug(
-                               alt, mtype == "movie") or ""))
-                    if rec:
-                        break
-    else:
-        return {"streams": []}
-    if not rec:
-        return {"streams": []}
-
+def _emit_cards(rec, season=None, episode=None):
+    """rec + episode -> Stremio stream cards (shared by /stream and
+    /find).  One card per PROVEN variant per language."""
     try:
         _absorb_live(rec, _live_rows(rec), season)
     except Exception:
@@ -1385,6 +1364,7 @@ def handle_stream(mtype, mid):
     dub_show = "dubbed" in (rec.get("site_name") or "").lower()
     has_dub = any(_lang_label(lang).lower() == "hindi" for lang in resolved)
     streams = []
+    proof_deadline = time.monotonic() + (PROOF_BUDGET / 1000.0)
     for lang in picks:                     # LANG_ORDER iteration order
         hit = resolved.get(lang)
         if not hit:
@@ -1393,8 +1373,20 @@ def handle_stream(mtype, mid):
         note = ""
         if dub_show and lang.lower() == "hindi sub" and not has_dub:
             note = "site has no dub for this episode yet"
-        streams.append(_phx_card(rec, lang, prefix, ep_title, note, z, base,
-                                 qres=mq_q))
+        # ★ v3.5.0: ALL proven variants as separate cards; a variant that
+            # fails the Range-206 proof never gets a card.
+        vcards = _mq_variant_cards(rec, lang, prefix, ep_title, note, z, base,
+                                   master, proof_deadline)
+        if vcards:
+            streams.extend(vcards)
+        else:
+            # কোনো ভ্যারিয়েন্ট প্রমাণ হয়নি -> প্লে-পথ আটকাই না, কিন্তু
+            # কার্ডেই স্পষ্ট লিখি (প্রমাণ ছাড়া "প্রমাণিত" দাবি নয়)
+            fn = "⚠ unproven" if CARD_PROOF != "0" else ""
+            streams.append(_phx_card(rec, lang, prefix, ep_title,
+                                     (note + " " + fn).strip(), z, base,
+                                     qres=mq_q,
+                                     proof={"ok": False, "why": "variant proof failed"}))
 
     # WatchNow direct sources (movies): signed per-language file URLs.
     # fsl -> direct; 10g -> same-origin /wn slice-proxy.
@@ -1405,7 +1397,354 @@ def handle_stream(mtype, mid):
             wq = _res_label(unquote(u.split("?")[0])) or _res_label(qn)
             streams.append(_phx_card(rec, lang, prefix, ep_title, "", u,
                                      base, src="WN", kind=kind, qres=wq))
-    return {"streams": streams}
+    return streams
+
+
+def handle_stream(mtype, mid):
+    """One MQ card per resolvable language.  Foreign tt-ids title-match
+    through Cinemeta.  Every request merges the live hub first (TTL
+    cached): the site rotates movie zippers and adds dubs/episodes
+    continuously, so the crawler snapshot goes stale within hours."""
+    season = episode = None
+    rec = None
+    if mid.startswith("raretoons2:"):
+        parts = mid[len("raretoons2:"):].split(":")
+        rec = SHOWS.get(parts[0])
+        if len(parts) >= 3:
+            try:
+                season, episode = int(parts[-2]), int(parts[-1])
+            except ValueError:
+                pass
+    elif re.match(r"^tt\d+$", mid.split(":")[0] or ""):
+        parts = mid.split(":")
+        try:
+            if len(parts) >= 3:
+                season, episode = int(parts[-2]), int(parts[-1])
+        except ValueError:
+            pass
+        title = _cinemeta_name(mtype, parts[0])
+        rec = _match_show(title, season, mtype) if title else None
+        if not rec and title:
+            rec = _sim_match(title, season, mtype)
+        if not rec and title:
+            # ALTERNATIVE-NAME PARALLEL FETCH: the site's own search and
+            # Cinemeta's alt titles race; either may rescue the match.
+            box = {}
+            ths = [
+                threading.Thread(target=lambda b=box: b.update(
+                    s=_site_search_slug(title, mtype == "movie")),
+                    daemon=True),
+                threading.Thread(target=lambda b=box: b.update(
+                    a=_imdb_names(mtype, parts[0])), daemon=True)]
+            for t0_ in ths:
+                t0_.start()
+            dl = time.monotonic() + 12
+            for t0_ in ths:
+                t0_.join(max(0.5, dl - time.monotonic()))
+            rec = SHOWS.get(box.get("s") or "")
+            if not rec:
+                for alt in (box.get("a") or []):
+                    rec = (_match_show(alt, season, mtype)
+                           or _sim_match(alt, season, mtype)
+                           or SHOWS.get(_site_search_slug(
+                               alt, mtype == "movie") or ""))
+                    if rec:
+                        break
+    else:
+        return {"streams": []}
+    if not rec:
+        return {"streams": []}
+
+    return {"streams": [{k: v for k, v in c.items() if not k.startswith("_")}
+                        for c in _emit_cards(rec, season, episode)]}
+
+
+# ======================= v3.5.0: per-variant cards + Range proof ============
+# ইউজার-নির্দেশ: "Ekta server keno only, seekable sob server thakbe" — একটি
+# ফাইলের প্রতিটি রেজোলিউশন আলাদা কার্ড, আর Range-প্রমাণ (HTTP 206 + ঠিক
+# Content-Range) ছাড়া কোনো কার্ড নয়।  MQ-এর মাস্টারে সাধারণত ৩টি ভ্যারিয়েন্ট
+# (360p/720p/1080p) থাকে; আগে শুধু সর্বোচ্চটা লেবেলে বসত আর প্লেয়ার master-এ
+# ABR ঠিক করত।  এখন প্রতিটার নিজের প্লেলিস্ট, নিজের প্রমাণ, নিজের কার্ড।
+_variants_cache = {}
+_proof_lock = threading.Lock()
+_proof_cache = {}
+VSTAT = {"proofs_ok": 0, "proofs_bad": 0, "variant_cards": 0, "finds": 0,
+         "finds_empty": 0, "find_ms": 0}
+_VAR_RE = re.compile(r"#EXT-X-STREAM-INF:([^\r\n]*)[\r\n]+\s*([^\r\n#][^\r\n]*)",
+                     re.I)
+
+
+def _master_variants(master):
+    """master playlist -> [{h, bw, uri}] (highest first), cached VAR_TTL."""
+    now = time.time()
+    with _hls_lock:
+        hit = _variants_cache.get(master)
+    if hit and hit[0] > now:
+        return hit[1]
+    out = []
+    try:
+        r = upstream_get(master, referer=ARGON, timeout=RESOLVE_TIMEOUT)
+        txt = r.text or "" if r.status_code == 200 else ""
+        for m in _VAR_RE.finditer(txt):
+            attrs, uri = m.group(1), m.group(2).strip()
+            hb = re.search(r"RESOLUTION=\d+x(\d+)", attrs, re.I)
+            bw = re.search(r"BANDWIDTH=(\d+)", attrs, re.I)
+            out.append({"h": int(hb.group(1)) if hb else 0,
+                        "bw": int(bw.group(1)) if bw else 0,
+                        "uri": urljoin(master, uri)})
+    except Exception:
+        out = []
+    out.sort(key=lambda v: (v["h"], v["bw"]), reverse=True)
+    if out:
+        with _hls_lock:
+            if len(_variants_cache) > 600:
+                _variants_cache.clear()
+            _variants_cache[master] = (now + VAR_TTL, out)
+    return out
+
+
+def _first_seg(text, base):
+    """First media segment of a variant playlist -> (abs_url, byterange)."""
+    br = None
+    for line in (text or "").splitlines():
+        ls = line.strip()
+        if ls.startswith("#EXT-X-BYTERANGE"):
+            mb = re.match(r"#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?", ls)
+            if mb:
+                br = (int(mb.group(2) or 0), int(mb.group(1)))
+            continue
+        if ls and not ls.startswith("#"):
+            return urljoin(base, ls), br
+    return None, None
+
+
+def _prove_variant(v):
+    """Range-প্রমাণ: ভ্যারিয়েন্ট-প্লেলিস্ট ২০০ + প্রথম সেগমেন্টে
+    `Range: bytes=…` → ২০৬ এবং Content-Range ঠিক আছে কি না।"""
+    key = v["uri"]
+    now = time.time()
+    with _proof_lock:
+        hit = _proof_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    pr = {"ok": False, "pl": 0, "seg": 0, "cr": "", "ctype": "", "ms": 0}
+    t0 = time.monotonic()
+    try:
+        r = upstream_get(v["uri"], referer=ARGON, timeout=RESOLVE_TIMEOUT)
+        pr["pl"] = r.status_code
+        txt = r.text or ""
+        if r.status_code == 200 and "#EXTINF" in txt:
+            seg, br = _first_seg(txt, v["uri"])
+            if seg:
+                rng = "bytes=0-1023"
+                if br and br[1] > 0:
+                    rng = f"bytes={br[0]}-{br[0] + min(1023, br[1] - 1)}"
+                # সেগমেন্ট-হোস্ট Cloudflare-এ মোড়া: plain requests → 403
+                # (মাপা), তাই প্লেলিস্টের মতোই impersonating ক্লায়েন্ট।
+                rr = upstream_stream(seg, referer=ARGON, rng=rng,
+                                     timeout=RESOLVE_TIMEOUT)
+                pr["seg"] = rr.status_code
+                pr["cr"] = rr.headers.get("Content-Range", "")
+                pr["ctype"] = rr.headers.get("Content-Type", "")
+                try:
+                    rr.close()
+                except Exception:
+                    pass
+                pr["ok"] = (rr.status_code == 206
+                            and re.match(r"\s*bytes\s+\d+-\d+/", pr["cr"] or "")
+                            is not None)
+                mt = re.match(r"\s*bytes\s+\d+-\d+/(\d+)", pr["cr"] or "")
+                if mt:
+                    pr["bytes"] = int(mt.group(1))
+    except Exception as exc:
+        pr["err"] = str(exc)[:60]
+    pr["ms"] = int((time.monotonic() - t0) * 1000)
+    with _proof_lock:
+        if len(_proof_cache) > 900:
+            _proof_cache.clear()
+        _proof_cache[key] = (now + (PROOF_TTL if pr["ok"] else PROOF_FAIL_TTL), pr)
+    with _proof_lock:
+        VSTAT["proofs_ok" if pr["ok"] else "proofs_bad"] += 1
+    return pr
+
+
+def _prove_all(vs, deadline):
+    """Prove every variant in parallel, bounded by `deadline` (monotonic)."""
+    out = [None] * len(vs)
+
+    def _run(i, v):
+        left = deadline - time.monotonic()
+        if left <= 0.3:
+            return
+        out[i] = _prove_variant(v)
+
+    ts = [threading.Thread(target=_run, args=(i, v), daemon=True)
+          for i, v in enumerate(vs)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(max(0.1, deadline - time.monotonic()) + 0.2)
+    return out
+
+
+def _mq_variant_cards(rec, lang, prefix, ep_title, note, zipper, base, master,
+                      deadline):
+    """সব প্রমাণিত ভ্যারিয়েন্টের আলাদা কার্ড (উচ্চ → নিচু)।"""
+    if CARD_PROOF == "0":
+        return []
+    vs = _master_variants(master)
+    if not vs:
+        return []
+    proofs = _prove_all(vs, deadline)
+    cards, unproven = [], 0
+    for v, pr in zip(vs, proofs):
+        if not pr or not pr.get("ok"):
+            unproven += 1
+            continue
+        cards.append(_phx_card(rec, lang, prefix, ep_title, note, zipper, base,
+                               vq=v["h"] or 0, proof=pr,
+                               mbps=(v["bw"] / 1e6) if v["bw"] else 0.0))
+    VSTAT["variant_cards"] += len(cards)
+    if cards:
+        # highest first; identical heights (different bw) collapse
+        seen, keep = set(), []
+        for c in cards:
+            if c["_vq"] in seen:
+                continue
+            seen.add(c["_vq"])
+            keep.append(c)
+        return keep
+    # কোনো ভ্যারিয়েন্টই প্রমাণ হয়নি -> [] (কলার ফলব্যাক দেয়)
+    if unproven:
+        VSTAT["proofs_bad"] += 0
+    return []
+
+
+def _serve_mq_variant(handler, zipper, res):
+    """`/mq/<tok>/p<res>.m3u8` — одному ভ্যারিয়েন্টের মিডিয়া প্লেলিস্ট,
+    same-origin rewrite (সেগমেন্টগুলো /mq/<tok>/u/… দিয়েই যায়)।"""
+    master, _ = _mq_resolve(zipper)
+    if not master:
+        handler._send({"error": "MQ stream unavailable - try again"}, 502)
+        return
+    vs = _master_variants(master)
+    v = None
+    for x in vs:
+        if x["h"] == res:
+            v = x
+            break
+    if v is None and vs:
+        v = min(vs, key=lambda z: abs((z["h"] or 0) - res))
+    if v is None:
+        _serve_m3u8_master(handler, zipper)
+        return
+    try:
+        r = None
+        for attempt in (1, 2):
+            try:
+                r = upstream_get(v["uri"], referer=ARGON,
+                                 timeout=RESOLVE_TIMEOUT)
+                if r.status_code == 200:
+                    break
+            except Exception:
+                if attempt == 2:
+                    raise
+            if attempt == 1:
+                with _hls_lock:
+                    _hls_cache.pop(zipper, None)
+                master, _ = _mq_resolve(zipper)
+                if master:
+                    vs2 = _master_variants(master)
+                    v = next((x for x in vs2 if x["h"] == res), v)
+        if r is None or r.status_code != 200:
+            handler._send({"error": "variant unavailable"}, 502)
+            return
+        body = _rewrite_m3u8(r.text or "", v["uri"],
+                             f"/mq/{_mq_token(zipper)}").encode()
+        handler._send_raw(body, CONTENT_TYPES[".m3u8"])
+    except Exception as exc:
+        handler._send({"error": f"variant: {exc}"}, 502)
+
+
+def _find_score(q, rec):
+    try:
+        from difflib import SequenceMatcher
+        return round(SequenceMatcher(None, q.lower(),
+                                     (rec.get("site_name") or "").lower()).ratio(), 3)
+    except Exception:
+        return 1.0
+
+
+def handle_find(qs):
+    """মেইন-অ্যাডনের কনট্রাক্ট: /find?source=&title=&season=&episode=
+    এখন **রেন্ডার-রেডি** কার্ড ফেরত দেয় (title/quality/lang/filename/
+    bingeGroup/proof) — মেইন-অ্যাডনকে আর কিছু হিসাব করতে হয় না।"""
+    g = lambda k, d="": ((qs.get(k) or [d])[0] or d)
+    title = str(g("title")).strip()
+    source = str(g("source", "raretoons")).strip().lower()
+    mtype = "series" if qs.get("season") else "movie"
+    try:
+        season = int(g("season") or 0) or None
+    except Exception:
+        season = None
+    try:
+        episode = int(g("episode") or 0) or None
+    except Exception:
+        episode = None
+    t0 = time.monotonic()
+    if source not in ("raretoons", "rt", ""):
+        # ★ v3.5.0: ToonWorld-এর রেসিপি এখনো এই রেজলভারে নেই — ভুল-শো কার্ড
+        #   দেখানোর চেয়ে সৎ-শূন্য ভালো (মেইন-অ্যাডন RT-কার্ড দুবার দেখাবে না)।
+        return {"ok": True, "service": "raretoons", "source": source,
+                "version": VERSION, "catalog": {}, "results": [],
+                "reason": "source not enabled here yet"}
+    rec = None
+    if title:
+        rec = (_match_show(title, season, mtype)
+               or _sim_match(title, season, mtype))
+        if not rec:
+            rec = SHOWS.get(_site_search_slug(title, mtype == "movie") or "")
+    cards = []
+    if rec:
+        cards = _emit_cards(rec, season, episode)
+    results = []
+    for c in cards:
+        u = str(c.get("url") or "")
+        if not re.match(r"^https?://", u):
+            continue
+        bh = c.get("behaviorHints") or {}
+        results.append({
+            "url": u,
+            "kind": c.get("_kind") or "hls",
+            "quality": str(c.get("_q") or ""),
+            "lang": c.get("_lang") or "",
+            "name": c.get("name") or "",
+            "title": c.get("title") or "",
+            "description": c.get("title") or "",
+            "filename": bh.get("filename") or "",
+            "bingeGroup": bh.get("bingeGroup") or "",
+            "card": 1,
+            "proof": c.get("_proof") or {},
+            "behaviorHints": {"notWebReady": False},
+        })
+    ms = int((time.monotonic() - t0) * 1000)
+    VSTAT["finds"] += 1
+    VSTAT["find_ms"] = ms
+    if not results:
+        VSTAT["finds_empty"] += 1
+    return {
+        "ok": True, "service": "raretoons", "source": source,
+        "version": VERSION,
+        "catalog": ({"show": rec.get("site_name") or "",
+                     "live": rec.get("slug") or "",
+                     "movie": bool(rec.get("movie")),
+                     "match": _find_score(title, rec)} if rec else {}),
+        "results": results,
+        "probe": {"ms": ms, "cards": len(results),
+                  "langs": sorted({r["lang"] for r in results if r["lang"]}),
+                  "proven": sum(1 for r in results if (r.get("proof") or {}).get("ok"))},
+    }
+
 
 # ---------------------------------------------------- /mq HLS rewriter -----
 _B64_RE = r"[A-Za-z0-9_\-]"
@@ -1851,6 +2190,29 @@ class Handler(BaseHTTPRequestHandler):
                          r"(raretoons2:[^/]+|tt\d+(?::\d+)*)\.json$", path)
             if m:
                 self._send(handle_stream(m.group(1), m.group(2)))
+                return
+
+            if path == "/find":
+                self._send(handle_find(qs))
+                return
+
+            if path == "/health":
+                alive = [v for v in _proof_cache.values() if v[0] > time.time()]
+                self._send({"ok": True, "service": "raretoons",
+                            "version": VERSION, "ver": "r-" + VERSION.replace(".", ""),
+                            "recipes": ["raretoons-mq", "raretoons-wn"],
+                            "rows": len(ROWS), "shows": len(SHOWS),
+                            "variants_cached": len(_variants_cache),
+                            "proofs_cached": len(alive), "stats": dict(VSTAT)})
+                return
+
+            m = re.match(rf"^/mq/({_B64_RE}+)/p(\d{{3,4}})\.m3u8$", path)
+            if m:
+                zipper = _mq_decode_token(m.group(1))
+                if not zipper.startswith("https://codedew.com/"):
+                    self._send({"error": "bad token"}, 400)
+                    return
+                _serve_mq_variant(self, zipper, int(m.group(2)))
                 return
 
             m = re.match(rf"^/mq/({_B64_RE}+)\.m3u8$", path)

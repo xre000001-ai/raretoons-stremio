@@ -282,3 +282,18 @@ long idle processes.
 - TMDB fetching requires outbound internet (blocked in some sandboxes but works on HuggingFace Spaces / Render / VPS). If TMDB fails, addon falls back to local titles and still serves streams.
 - This is an index of a third-party piracy aggregator — for personal use, and
   the copyright exposure is yours. Sites/links may break at any time.
+
+## v3.5.0 — resolver endpoints (main-addon contract)
+
+| Route | Purpose |
+|---|---|
+| `/stream/:type/:id.json` | Stremio-native cards (one per **proven variant** per language) |
+| `/find?source=raretoons&title=&season=&episode=` | **Render-ready** cards for the main addon: `card:1`, `title`, `quality`, `lang`, `filename`, `bingeGroup`, `proof{pl,seg,cr,bytes}`, `catalog{show,live,match}` |
+| `/health` | version, recipes, cached variants/proofs, counters |
+| `/mq/<token>.m3u8` | auto (ABR master, legacy) |
+| `/mq/<token>/p<height>.m3u8` | one rendition's media playlist (rewritten same-origin) |
+| `/mq/<token>/u/<b64>` | proxied segment/key/child playlist |
+
+Every emitted card has passed a **Range proof** (variant playlist 200 +
+first segment `206` with a real `Content-Range`); proofs are cached
+`PROOF_TTL` (300 s), failures 60 s.
