@@ -1603,7 +1603,7 @@ def _mq_variant_cards(rec, lang, prefix, ep_title, note, zipper, base, master,
             continue
         cards.append(_phx_card(rec, lang, prefix, ep_title, note, zipper, base,
                                vq=v["h"] or 0, proof=pr,
-                               mbps=(v["bw"] / 1e6) if v["bw"] else 0.0))
+                               mbps=(v["bw"] / 1e6) if v["bw"] >= 200000 else 0.0))
     VSTAT["variant_cards"] += len(cards)
     if cards:
         # highest first; identical heights (different bw) collapse
