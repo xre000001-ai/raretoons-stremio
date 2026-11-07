@@ -34,7 +34,7 @@ STATE_JSON = ROOT / "crawl_state.json"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-HOST = "www.rareanimes.com"
+HOST = "www.rareanimes.fans"
 STORE_HOST = "store.animetoonhindi.com"
 
 SKIP_SUBSTR = (
@@ -172,7 +172,7 @@ def log_jsonl(path, obj):
 # ---------- parsing ----------
 def internal_links(html):
     out = set()
-    for m in re.finditer(r'href="(https?://www\.rareanimes\.mov/[^"]+)"', html):
+    for m in re.finditer(r'href="(https?://www\.rareanimes\.fans/[^"]+)"', html):
         u = m.group(1).split("#")[0]
         if is_content(u):
             out.add(canon(u))

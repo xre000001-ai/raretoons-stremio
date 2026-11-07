@@ -82,11 +82,11 @@ PROOF_FAIL_TTL  = _env_int("PROOF_FAIL_TTL", 60)   # unproven variant re-probe
 PROOF_BUDGET    = _env_int("PROOF_BUDGET", 6000)   # ms, whole variant-proof pass
 CARD_PROOF      = os.environ.get("CARD_PROOF", "1") != "0"   # 0 = exempt from proof
 
-VERSION  = "3.5.0"
+VERSION  = "3.5.1"
 ADDON_ID = "community.raretoons2"
 ADDON_NAME = "RareToons"
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-SITE = "https://www.rareanimes.mov/"
+SITE = "https://www.rareanimes.fans/"
 ARGON = "https://argon.razorshell.space/"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")

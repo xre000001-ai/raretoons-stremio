@@ -2,7 +2,7 @@
 """Incremental RareToons index refresh — add new shows + recent updates.
 
 The addon serves from the pre-crawled index (episodes_index.jsonl +
-streams.json), so shows uploaded to rareanimes.mov AFTER the last crawl are
+streams.json), so shows uploaded to rareanimes.fans AFTER the last crawl are
 invisible in Stremio (no meta match -> empty episode list). This script:
 
   1. collects the newest hub pages: the WordPress RSS feed (/feed/?paged=N)
@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT))
 import crawler as C          # noqa: E402
 import parse_hubs as P       # noqa: E402
 
-SITE = "https://www.rareanimes.mov"
+SITE = "https://www.rareanimes.fans"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
 
